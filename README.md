@@ -4,12 +4,52 @@ This project is a functional desktop prototype for the WeRhere resident operatio
 
 ## Quick start
 
-1. Create and activate a virtual environment if desired.
-2. Install dependencies:
+Clone the project and enter its folder:
+
+```powershell
+git clone https://github.com/Dilbers/WeRhere.git
+Set-Location WeRhere
+```
+
+Create a virtual environment and install the dependencies:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Then launch the app:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.main
+```
+
+On first launch, the app creates `wehere.db` in the project folder, initializes
+its tables, and adds local starter accounts and sample records. Each person gets
+their own local database; this desktop app does not synchronize data between
+computers.
+
+The virtual environment is machine-specific, so it is recreated from
+`requirements.txt` rather than copied from another computer. VS Code settings
+are optional editor preferences and are not needed to run the app.
+
+The starter sign-in accounts are created in each new local database:
+
+| Account | Username | Password |
+|---|---|---|
+| Administrator | `admin` | `admin123` |
+| Resident | `resident` | `resident123` |
+
+These are shared starter credentials, not private user accounts. Change them
+before using the application with real data.
+
+To install without a virtual environment instead:
+
+1. Install the listed dependency:
    ```bash
    pip install -r requirements.txt
    ```
-3. Run the app:
+2. Run the app:
    ```bash
    python -m app.main
    ```

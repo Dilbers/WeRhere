@@ -1,0 +1,13 @@
+<svg width="420" height="120" viewBox="0 0 420 120" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="grad1" x1="0" x2="1">
+      <stop offset="0%" stop-color="#FF8A65"/>
+      <stop offset="100%" stop-color="#FF5E7A"/>
+    </linearGradient>
+  </defs>
+  <rect width="420" height="120" rx="28" fill="#FFFFFF"/>
+  <rect x="18" y="18" width="84" height="84" rx="24" fill="url(#grad1)"/>
+  <path d="M32 85 L47 42 L60 70 L73 42 L88 85" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="124" y="62" fill="#34434B" font-family="Arial, sans-serif" font-size="34" font-weight="700">WeRhere</text>
+  <text x="126" y="88" fill="#7B8995" font-family="Arial, sans-serif" font-size="15" font-weight="600">Resident operations</text>
+</svg>

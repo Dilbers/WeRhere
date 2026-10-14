@@ -1,0 +1,7 @@
+.venv/
+.vs/
+.vscode/
+__pycache__/
+*.py[cod]
+wehere.db
+*.db

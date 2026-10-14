@@ -1,0 +1,334 @@
+* {
+    color: #26364a;
+}
+
+QMainWindow, QDialog {
+    background: #f4f7fb;
+}
+
+#sidebar {
+    background: #ffffff;
+    border-right: 1px solid #e6ebf2;
+}
+
+#sidebarUser {
+    color: #25364a;
+    font-size: 13px;
+    font-weight: 700;
+    padding-top: 8px;
+}
+
+#roleBadge {
+    background: #eef3f8;
+    color: #527087;
+    border-radius: 9px;
+    padding: 6px 9px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1px;
+}
+
+#accountAvatar {
+    background: #fff0ed;
+    border: 1px solid #f1d2cb;
+    border-radius: 29px;
+    color: #c94d48;
+    font-size: 22px;
+    font-weight: 800;
+}
+
+#accountName {
+    color: #25364a;
+    font-size: 20px;
+    font-weight: 700;
+}
+
+#mainArea, QStackedWidget {
+    background: #f4f7fb;
+}
+
+#panel {
+    background: #ffffff;
+    border: 1px solid #e6ebf2;
+    border-radius: 16px;
+    padding: 18px;
+}
+
+#pageTitle {
+    color: #1e2d40;
+    font-size: 27px;
+    font-weight: 800;
+}
+
+#loginTitle {
+    color: #1e2d40;
+    font-size: 25px;
+    font-weight: 800;
+}
+
+#pageSubtitle {
+    color: #77869a;
+    font-size: 13px;
+}
+
+#panelTitle {
+    color: #25364a;
+    font-size: 17px;
+    font-weight: 700;
+    padding-bottom: 5px;
+}
+
+#nextStep {
+    color: #247a68;
+    font-size: 18px;
+    font-weight: 700;
+    padding: 8px 0;
+}
+
+#supportNote {
+    background: #f3f7fb;
+    border-left: 3px solid #56a7b5;
+    border-radius: 9px;
+    color: #53667b;
+    padding: 14px;
+}
+
+#detailLabel {
+    color: #718198;
+    font-size: 11px;
+    font-weight: 700;
+    padding-top: 8px;
+}
+
+#detailValue {
+    color: #26364a;
+    font-size: 14px;
+    padding: 5px 0 8px;
+}
+
+#navButton {
+    min-height: 42px;
+    border: none;
+    border-radius: 10px;
+    background: transparent;
+    color: #627187;
+    text-align: left;
+    padding: 0 14px;
+    font-weight: 600;
+}
+
+#navButton:hover {
+    background: #f3f6fa;
+    color: #26364a;
+}
+
+#navButtonActive {
+    min-height: 42px;
+    border: none;
+    border-radius: 10px;
+    background: #fff0ed;
+    color: #c94d48;
+    text-align: left;
+    padding: 0 14px;
+    font-weight: 700;
+}
+
+QLineEdit, QComboBox, QTextEdit {
+    min-height: 36px;
+    border-radius: 9px;
+    border: 1px solid #dfe6ef;
+    background: #ffffff;
+    color: #26364a;
+    padding: 6px 10px;
+    selection-background-color: #f2b9ae;
+}
+
+QLineEdit:focus, QComboBox:focus, QTextEdit:focus {
+    border: 1px solid #d97b6d;
+}
+
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    color: #26364a;
+    selection-background-color: #fff0ed;
+}
+
+QPushButton {
+    min-height: 36px;
+    border: 1px solid #dfe6ef;
+    border-radius: 9px;
+    background: #ffffff;
+    color: #40536a;
+    padding: 0 13px;
+    font-weight: 600;
+}
+
+QPushButton:hover {
+    background: #f7f9fc;
+    border-color: #c9d4e1;
+}
+
+QPushButton:pressed {
+    background: #edf1f6;
+}
+
+#primaryButton {
+    min-height: 40px;
+    border: none;
+    border-radius: 10px;
+    background: #cf4f4b;
+    color: #ffffff;
+    font-weight: 700;
+    padding: 0 18px;
+}
+
+#primaryButton:hover {
+    background: #b8423f;
+}
+
+#secondaryButton {
+    background: #f0f4f8;
+    border: 1px solid #dfe6ef;
+}
+
+#dangerButton {
+    background: #fff1f0;
+    border: 1px solid #f0c9c6;
+    color: #ae4642;
+}
+
+#ghostButton {
+    min-height: 40px;
+    border: 1px solid #dfe6ef;
+    border-radius: 10px;
+    background: #ffffff;
+    color: #40536a;
+    font-weight: 600;
+    padding: 0 16px;
+}
+
+QTableWidget {
+    background: #ffffff;
+    alternate-background-color: #f8fafc;
+    color: #34465b;
+    gridline-color: #edf1f5;
+    border: 1px solid #e6ebf2;
+    border-radius: 12px;
+    selection-background-color: #fff0ed;
+    selection-color: #26364a;
+    outline: 0;
+}
+
+QTableWidget::item {
+    padding: 9px;
+    border-bottom: 1px solid #edf1f5;
+}
+
+QTableWidget::item:selected {
+    background: #fff0ed;
+    color: #26364a;
+}
+
+QHeaderView::section {
+    background: #f5f7fa;
+    color: #65758a;
+    padding: 11px 8px;
+    border: none;
+    border-bottom: 1px solid #e6ebf2;
+    font-weight: 700;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 3px;
+}
+
+QScrollBar::handle:vertical {
+    background: #cbd5e1;
+    border-radius: 5px;
+    min-height: 24px;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+    border: none;
+}
+
+#errorMessage {
+    color: #b44440;
+    font-size: 12px;
+    font-weight: 600;
+    min-height: 18px;
+}
+
+#textButton {
+    min-height: 28px;
+    border: none;
+    background: transparent;
+    color: #c94d48;
+    padding: 0 4px;
+}
+
+#textButton:hover {
+    background: #fff0ed;
+}
+
+#eventRow {
+    background: #f7f9fc;
+    border: 1px solid #edf1f5;
+    border-radius: 10px;
+}
+
+#eventTitle {
+    color: #34465b;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+#attentionRow {
+    background: #f7f9fc;
+    border: 1px solid #edf1f5;
+    border-radius: 10px;
+}
+
+#journeyStepComplete, #journeyStepCurrent, #journeyStepPending {
+    border-radius: 11px;
+}
+
+#journeyStepComplete {
+    background: #edf7f3;
+    border: 1px solid #d5ebe2;
+}
+
+#journeyStepCurrent {
+    background: #fff3ef;
+    border: 1px solid #f1d2cb;
+}
+
+#journeyStepPending {
+    background: #f7f9fc;
+    border: 1px solid #e6ebf2;
+}
+
+#journeyStepNumber {
+    color: #c94d48;
+    font-size: 11px;
+    font-weight: 800;
+}
+
+#journeyStepLabel {
+    color: #40536a;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+#emptyState {
+    background: #ffffff;
+    border: 1px dashed #cbd5e1;
+    border-radius: 14px;
+    color: #77869a;
+    font-size: 14px;
+    padding: 28px;
+}

@@ -4,9 +4,10 @@ from collections import Counter
 from datetime import datetime
 import os
 from pathlib import Path
+from urllib.parse import quote
 
-from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import QSettings, Qt, QUrl
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -29,10 +31,100 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .backend import initialize_database
+from .backend import DriveImportError, initialize_database
+from .localization import LANGUAGES, translate
 
 
 _UI_FONT_FAMILY: str | None = None
+_CURRENT_LANGUAGE = "en"
+_SOURCE_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 20
+
+
+def _localized_stylesheet() -> str:
+    style_path = Path(__file__).with_name("styles.qss")
+    chevron_path = (
+        Path(__file__).resolve().parent / "assets" / "chevron-down.svg"
+    ).as_posix()
+    return style_path.read_text(encoding="utf-8").replace(
+        "@CHEVRON_DOWN@", chevron_path
+    )
+
+
+def _apply_language_to_widgets(root: QWidget, language: str) -> None:
+    def translate_widget_text(widget: QWidget, property_name: str, getter, setter) -> None:
+        source = widget.property(property_name)
+        applied = widget.property(f"{property_name}Applied")
+        current = getter()
+        if source is None or current != applied:
+            source = current
+            widget.setProperty(property_name, source)
+        translated = translate(source, language)
+        setter(translated)
+        widget.setProperty(f"{property_name}Applied", translated)
+
+    for widget in root.findChildren(QWidget):
+        translate_widget_text(
+            widget,
+            "languageSourceToolTip",
+            widget.toolTip,
+            widget.setToolTip,
+        )
+        if isinstance(widget, QLabel):
+            translate_widget_text(
+                widget,
+                "languageSourceText",
+                widget.text,
+                widget.setText,
+            )
+        elif isinstance(widget, QPushButton):
+            translate_widget_text(
+                widget,
+                "languageSourceText",
+                widget.text,
+                widget.setText,
+            )
+
+        if isinstance(widget, QLineEdit):
+            translate_widget_text(
+                widget,
+                "languageSourcePlaceholder",
+                widget.placeholderText,
+                widget.setPlaceholderText,
+            )
+        elif isinstance(widget, QTextEdit):
+            translate_widget_text(
+                widget,
+                "languageSourcePlaceholder",
+                widget.placeholderText,
+                widget.setPlaceholderText,
+            )
+
+        if isinstance(widget, QComboBox) and widget.objectName() != "languageSelector":
+            was_blocked = widget.blockSignals(True)
+            for index in range(widget.count()):
+                source = widget.itemData(index, _SOURCE_TEXT_ROLE)
+                if source is None:
+                    source = widget.itemText(index)
+                    widget.setItemData(index, source, _SOURCE_TEXT_ROLE)
+                widget.setItemText(index, translate(source, language))
+            widget.blockSignals(was_blocked)
+
+        if isinstance(widget, QTableWidget):
+            for column in range(widget.columnCount()):
+                header = widget.horizontalHeaderItem(column)
+                if header is not None:
+                    source = header.data(_SOURCE_TEXT_ROLE)
+                    if source is None:
+                        source = header.text()
+                        header.setData(_SOURCE_TEXT_ROLE, source)
+                    header.setText(translate(source, language))
+            for row in range(widget.rowCount()):
+                for column in range(widget.columnCount()):
+                    item = widget.item(row, column)
+                    if item is not None:
+                        source = item.data(_SOURCE_TEXT_ROLE)
+                        if source is not None:
+                            item.setText(translate(source, language))
 
 
 def _register_windows_font() -> None:
@@ -82,29 +174,204 @@ class LoginDialog(QDialog):
     def __init__(self):
         super().__init__()
         _register_windows_font()
-        self.setWindowTitle("WeRhere | Sign in")
-        self.setFixedSize(480, 480)
-        style_path = Path(__file__).with_name("styles.qss")
-        self.setStyleSheet(style_path.read_text(encoding="utf-8"))
+        self.settings = QSettings("WeRhere", "CommunityWorkspace")
+        self.language = self.settings.value("language", "en", type=str)
+        if self.language not in {code for _name, code in LANGUAGES}:
+            self.language = "en"
+        global _CURRENT_LANGUAGE
+        _CURRENT_LANGUAGE = self.language
+        self.setWindowTitle(translate("WeRhere | Welcome", self.language))
+        self.setFixedSize(820, 600)
+        self.setStyleSheet(_localized_stylesheet())
         self.db = initialize_database()
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(42, 34, 42, 30)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.auth_stack = QStackedWidget()
+        self.welcome_page = self._build_welcome_page()
+        self.sign_in_page = self._build_sign_in_page()
+        self.auth_stack.addWidget(self.welcome_page)
+        self.auth_stack.addWidget(self.sign_in_page)
+        layout.addWidget(self.auth_stack)
+        self.auth_stack.setCurrentWidget(self.welcome_page)
+        self._sync_language_selectors()
+        _apply_language_to_widgets(self, self.language)
+
+    def _create_language_selector(self) -> QComboBox:
+        selector = QComboBox()
+        selector.setObjectName("languageSelector")
+        selector.setMinimumWidth(148)
+        for name, code in LANGUAGES:
+            selector.addItem(f"{code.upper()}  ·  {name}", code)
+        selector.setCurrentIndex(
+            max(0, selector.findData(self.language))
+        )
+        selector.currentIndexChanged.connect(self._change_language)
+        return selector
+
+    def _sync_language_selectors(self) -> None:
+        selectors = self.findChildren(QComboBox, "languageSelector")
+        for selector in selectors:
+            index = selector.findData(self.language)
+            if index >= 0 and selector.currentIndex() != index:
+                selector.blockSignals(True)
+                selector.setCurrentIndex(index)
+                selector.blockSignals(False)
+
+    def _change_language(self, _index: int) -> None:
+        selector = self.sender()
+        if not isinstance(selector, QComboBox):
+            return
+        self.language = selector.currentData()
+        global _CURRENT_LANGUAGE
+        _CURRENT_LANGUAGE = self.language
+        self.settings.setValue("language", self.language)
+        self.error_label.clear()
+        self.setWindowTitle(
+            translate("WeRhere | Welcome", self.language)
+            if self.auth_stack.currentWidget() is self.welcome_page
+            else translate("WeRhere | Sign in", self.language)
+        )
+        self._sync_language_selectors()
+        _apply_language_to_widgets(self, self.language)
+
+    def _build_welcome_page(self):
+        page = QWidget()
+        page.setObjectName("welcomePage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(44, 28, 44, 30)
+        layout.setSpacing(22)
+
+        header = QHBoxLayout()
+        header.addWidget(BrandLogoWidget(210, 62))
+        header.addStretch()
+        access_label = QLabel("VIT CANDIDATE CRM")
+        access_label.setObjectName("accessLabel")
+        header.addWidget(access_label)
+        header.addSpacing(12)
+        header.addWidget(self._create_language_selector())
+        layout.addLayout(header)
+
+        content = QHBoxLayout()
+        content.setSpacing(24)
+        welcome_content = QVBoxLayout()
+        welcome_content.setSpacing(14)
+
+        eyebrow = QLabel("CANDIDATE PROGRESS, IN ONE PLACE")
+        eyebrow.setObjectName("welcomeEyebrow")
+        welcome_content.addWidget(eyebrow)
+        title = QLabel("Welcome to\nWeRhere")
+        title.setObjectName("welcomeTitle")
+        title.setWordWrap(True)
+        welcome_content.addWidget(title)
+        introduction = QLabel(
+            "Review IT training applications, mentor recommendations, and project interviews."
+        )
+        introduction.setObjectName("welcomeDescription")
+        introduction.setWordWrap(True)
+        welcome_content.addWidget(introduction)
+        welcome_content.addSpacing(6)
+
+        benefits = QVBoxLayout()
+        benefits.setSpacing(12)
+        for text in (
+            "Find applicants and review mentor assignment status",
+            "Read mentor recommendations, scores, and notes",
+            "Track projects sent to candidates and received back",
+        ):
+            item = QLabel(f"✓   {text}")
+            item.setObjectName("welcomeBenefit")
+            item.setWordWrap(True)
+            benefits.addWidget(item)
+        welcome_content.addLayout(benefits)
+        welcome_content.addStretch()
+        sign_in_button = QPushButton("Sign in to your account")
+        sign_in_button.setObjectName("primaryButton")
+        sign_in_button.setMinimumHeight(48)
+        sign_in_button.clicked.connect(self._show_sign_in)
+        welcome_content.addWidget(sign_in_button)
+
+        sign_up_note = QLabel(
+            "Need access? Contact your programme coordinator."
+        )
+        sign_up_note.setObjectName("welcomeFootnote")
+        sign_up_note.setWordWrap(True)
+        welcome_content.addWidget(sign_up_note)
+        content.addLayout(welcome_content, 3)
+
+        highlight = QFrame()
+        highlight.setObjectName("welcomeHighlight")
+        highlight_layout = QVBoxLayout(highlight)
+        highlight_layout.setContentsMargins(24, 26, 24, 26)
+        highlight_layout.setSpacing(16)
+        highlight_label = QLabel("THE CANDIDATE JOURNEY")
+        highlight_label.setObjectName("highlightEyebrow")
+        highlight_layout.addWidget(highlight_label)
+        highlight_title = QLabel("From application to interview.")
+        highlight_title.setObjectName("highlightTitle")
+        highlight_title.setWordWrap(True)
+        highlight_layout.addWidget(highlight_title)
+        highlight_description = QLabel(
+            "Keep applications, mentor reviews, and project progress visible together."
+        )
+        highlight_description.setObjectName("highlightDescription")
+        highlight_description.setWordWrap(True)
+        highlight_layout.addWidget(highlight_description)
+        highlight_layout.addStretch()
+        for number, caption in (
+            ("01", "Applications"),
+            ("02", "Mentor interviews"),
+            ("03", "Project interviews"),
+        ):
+            line = QHBoxLayout()
+            number_label = QLabel(number)
+            number_label.setObjectName("highlightNumber")
+            caption_label = QLabel(caption)
+            caption_label.setObjectName("highlightCaption")
+            line.addWidget(number_label)
+            line.addWidget(caption_label)
+            line.addStretch()
+            highlight_layout.addLayout(line)
+        content.addWidget(highlight, 2)
+        layout.addLayout(content, 1)
+
+        footer = QLabel("One clear workspace for the VIT programme.")
+        footer.setObjectName("welcomeFooter")
+        layout.addWidget(footer, alignment=Qt.AlignmentFlag.AlignHCenter)
+        return page
+
+    def _build_sign_in_page(self):
+        page = QWidget()
+        page.setObjectName("signInPage")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(80, 28, 80, 30)
         layout.setSpacing(14)
 
-        logo = BrandLogoWidget(270, 78)
-        layout.addWidget(logo, alignment=Qt.AlignmentFlag.AlignCenter)
+        header = QHBoxLayout()
+        back_button = QPushButton("←  Back")
+        back_button.setObjectName("textButton")
+        back_button.clicked.connect(self._show_welcome)
+        header.addWidget(back_button)
+        header.addStretch()
+        header.addWidget(BrandLogoWidget(165, 48))
+        header.addStretch()
+        header.addWidget(self._create_language_selector())
+        layout.addLayout(header)
 
+        layout.addStretch()
+        secure_access = QLabel("SECURE ACCESS")
+        secure_access.setObjectName("welcomeEyebrow")
+        layout.addWidget(secure_access)
         title = QLabel("Welcome back")
         title.setObjectName("loginTitle")
         layout.addWidget(title)
-        introduction = QLabel("Sign in to continue to your workspace.")
+        introduction = QLabel("Sign in to continue to your WeRhere workspace.")
         introduction.setObjectName("pageSubtitle")
         layout.addWidget(introduction)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        form.setVerticalSpacing(10)
+        form.setVerticalSpacing(12)
         form.setHorizontalSpacing(0)
         self.username_edit = QLineEdit()
         self.username_edit.setMinimumHeight(42)
@@ -114,21 +381,75 @@ class LoginDialog(QDialog):
         self.password_edit.setPlaceholderText("Password")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         form.addRow("Username", self.username_edit)
-        form.addRow("Password", self.password_edit)
+        password_row = QHBoxLayout()
+        password_row.setSpacing(8)
+        password_row.addWidget(self.password_edit, 1)
+        self.password_visibility_button = QPushButton("Show")
+        self.password_visibility_button.setObjectName("passwordVisibilityButton")
+        self.password_visibility_button.setCheckable(True)
+        self.password_visibility_button.toggled.connect(self._toggle_password_visibility)
+        password_row.addWidget(self.password_visibility_button)
+        form.addRow("Password", password_row)
         layout.addLayout(form)
 
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Sign in")
-        button_box.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primaryButton")
-        button_box.button(QDialogButtonBox.StandardButton.Ok).setMinimumHeight(44)
-        button_box.accepted.connect(self._attempt_login)
-        layout.addWidget(button_box)
+        help_row = QHBoxLayout()
+        self.account_help = QLabel("Accounts are provided by your coordinator.")
+        self.account_help.setObjectName("pageSubtitle")
+        help_row.addWidget(self.account_help)
+        help_row.addStretch()
+        self.forgot_password_button = QPushButton("Forgot password?")
+        self.forgot_password_button.setObjectName("textButton")
+        self.forgot_password_button.clicked.connect(self._show_password_help)
+        help_row.addWidget(self.forgot_password_button)
+        layout.addLayout(help_row)
+
+        self.sign_in_button = QPushButton("Sign in")
+        self.sign_in_button.setObjectName("primaryButton")
+        self.sign_in_button.setMinimumHeight(46)
+        self.sign_in_button.clicked.connect(self._attempt_login)
+        layout.addWidget(self.sign_in_button)
 
         self.error_label = QLabel("")
         self.error_label.setObjectName("errorMessage")
         layout.addWidget(self.error_label)
         self.password_edit.returnPressed.connect(self._attempt_login)
         layout.addStretch()
+        return page
+
+    def _show_sign_in(self):
+        self.setWindowTitle(translate("WeRhere | Sign in", self.language))
+        self.auth_stack.setCurrentWidget(self.sign_in_page)
+        self.username_edit.setFocus()
+
+    def _show_welcome(self):
+        self.setWindowTitle(translate("WeRhere | Welcome", self.language))
+        self.auth_stack.setCurrentWidget(self.welcome_page)
+
+    def _toggle_password_visibility(self, visible: bool):
+        self.password_edit.setEchoMode(
+            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        )
+        self.password_visibility_button.setText("Hide" if visible else "Show")
+        self.password_visibility_button.setProperty(
+            "languageSourceText", "Hide" if visible else "Show"
+        )
+        self.password_visibility_button.setProperty(
+            "languageSourceTextApplied", translate(
+                "Hide" if visible else "Show", self.language
+            )
+        )
+        self.password_visibility_button.setText(
+            translate("Hide" if visible else "Show", self.language)
+        )
+
+    def _show_password_help(self):
+        self.error_label.setText(
+            translate(
+                "Password reset is not available in this local app. "
+                "Please contact your programme coordinator.",
+                self.language,
+            )
+        )
 
     def _attempt_login(self):
         username = self.username_edit.text().strip()
@@ -137,8 +458,11 @@ class LoginDialog(QDialog):
         if self.authenticated_user is not None:
             self.accept()
         else:
-            self.error_label.setText("Invalid username or password.")
+            self.error_label.setText(
+                translate("Invalid username or password.", self.language)
+            )
             self.password_edit.clear()
+            self.password_edit.setFocus()
 
 
 class DashboardCard(QFrame):
@@ -178,7 +502,11 @@ class DashboardCard(QFrame):
 class ApplicationDialog(QDialog):
     def __init__(self, record=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Application" if record is None else "Edit Application")
+        self.language = _CURRENT_LANGUAGE
+        self.setStyleSheet(_localized_stylesheet())
+        self.setWindowTitle(
+            translate("Application" if record is None else "Edit Application", self.language)
+        )
         self.resize(520, 420)
 
         self.applicant_name = QLineEdit(record["applicant_name"] if record else "")
@@ -186,11 +514,17 @@ class ApplicationDialog(QDialog):
         self.location = QLineEdit(record["location"] if record else "")
 
         self.status = QComboBox()
-        self.status.addItems(["Pending", "In review", "Approved", "Needs follow-up"])
+        self.status.addItems(
+            ["Pending", "In review", "Approved", "Needs follow-up", "DONE", "Not provided"]
+        )
+        if record and self.status.findText(record["status"]) < 0:
+            self.status.addItem(record["status"])
         self.status.setCurrentText(record["status"] if record else "Pending")
 
         self.priority = QComboBox()
-        self.priority.addItems(["High", "Medium", "Low"])
+        self.priority.addItems(["High", "Medium", "Low", "Not specified"])
+        if record and self.priority.findText(record["priority"]) < 0:
+            self.priority.addItem(record["priority"])
         self.priority.setCurrentText(record["priority"] if record else "Medium")
 
         self.last_update = QLineEdit(record["last_update"] if record else "Today")
@@ -209,69 +543,150 @@ class ApplicationDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addWidget(buttons)
+        _apply_language_to_widgets(self, self.language)
 
     def data(self):
         return {
             "applicant_name": self.applicant_name.text().strip(),
             "type_name": self.type_name.text().strip(),
             "location": self.location.text().strip(),
-            "status": self.status.currentText(),
-            "priority": self.priority.currentText(),
+            "status": self.status.currentData(_SOURCE_TEXT_ROLE),
+            "priority": self.priority.currentData(_SOURCE_TEXT_ROLE),
             "last_update": self.last_update.text().strip() or "Today",
             "notes": self.notes.toPlainText().strip(),
         }
 
 
-class MeetingDialog(QDialog):
-    def __init__(self, record=None, parent=None, residents=None):
+class ApplicationSourceDialog(QDialog):
+    def __init__(self, headers, values=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Meeting" if record is None else "Edit Meeting")
-        self.resize(450, 250)
+        self.language = _CURRENT_LANGUAGE
+        self.setStyleSheet(_localized_stylesheet())
+        self.setWindowTitle(
+            translate("New applicant" if values is None else "Edit applicant", self.language)
+        )
+        self.resize(680, 620)
+        self.fields = {}
+        self.original_values = values or {}
 
-        self.title = QLineEdit(record["title"] if record else "")
+        layout = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+        values = values or {}
+        for header in headers:
+            editor = QLineEdit("" if values.get(header) is None else str(values[header]))
+            self.fields[header] = editor
+            form.addRow(header, editor)
+        scroll.setWidget(form_widget)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("errorMessage")
+        layout.addWidget(self.error_label)
+        _apply_language_to_widgets(self, self.language)
+
+    def _accept_if_valid(self):
+        name = self.fields.get("Full Name")
+        if name is None or not name.text().strip():
+            self.error_label.setText(
+                translate("Candidate name is required.", self.language)
+            )
+            return
+        self.accept()
+
+    def data(self):
+        values = {}
+        for header, editor in self.fields.items():
+            text = editor.text()
+            original = self.original_values.get(header)
+            values[header] = (
+                original
+                if (original is None and not text)
+                or (original is not None and text == str(original))
+                else text
+            )
+        if values.get("Full Name"):
+            values["Full Name"] = str(values["Full Name"]).strip().title()
+        return values
+
+
+class MeetingDialog(QDialog):
+    def __init__(self, record=None, parent=None, candidates=None, mentors=None):
+        super().__init__(parent)
+        self.language = _CURRENT_LANGUAGE
+        self.setStyleSheet(_localized_stylesheet())
+        self.setWindowTitle(
+            translate("Schedule mentor interview" if record is None else "Edit mentor interview", self.language)
+        )
+        self.resize(480, 260)
+
+        self.title = QLineEdit("Mentor interview")
+        self.title.setReadOnly(True)
         self.meeting_time = QLineEdit(record["meeting_time"] if record else "")
         self.meeting_time.setPlaceholderText("YYYY-MM-DD HH:MM")
-        self.mentor_name = QLineEdit(
-            record.get("mentor_name", "Community team") if record else ""
+        self.mentor_name = QComboBox()
+        self.mentor_name.setEditable(True)
+        self.mentor_name.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for mentor in mentors or []:
+            self.mentor_name.addItem(mentor, mentor)
+        self.mentor_name.lineEdit().setPlaceholderText(
+            translate("Select or type an interviewer", self.language)
         )
-        self.mentor_name.setPlaceholderText("Mentor or team")
-        self.resident_name = QComboBox()
-        self.resident_name.addItem("Not assigned", "")
-        for resident in (residents or []):
-            self.resident_name.addItem(resident["name"], resident["name"])
+        if record and record.get("mentor_name"):
+            self.mentor_name.setCurrentText(record["mentor_name"])
+        self.mentor_name.setEditText(
+            record.get("mentor_name", "") if record else ""
+        )
+        self.candidate_name = QComboBox()
+        for candidate in candidates or []:
+            self.candidate_name.addItem(candidate, candidate)
         if record:
-            match = self.resident_name.findData(record.get("resident_name", ""))
-            self.resident_name.setCurrentIndex(max(match, 0))
+            match = self.candidate_name.findData(record.get("resident_name", ""))
+            if match < 0 and record.get("resident_name"):
+                self.candidate_name.addItem(record["resident_name"])
+                match = self.candidate_name.count() - 1
+            self.candidate_name.setCurrentIndex(max(match, 0))
         self.status = QComboBox()
-        self.status.addItems(["Scheduled", "Pending", "Approved", "Cancelled"])
+        self.status.addItems(["Scheduled", "Pending", "Approved", "Cancelled", "Completed"])
         self.status.setCurrentText(record["status"] if record else "Scheduled")
 
         form = QFormLayout(self)
         form.addRow("Title", self.title)
         form.addRow("Time", self.meeting_time)
         form.addRow("Mentor", self.mentor_name)
-        form.addRow("Resident", self.resident_name)
+        form.addRow("Candidate", self.candidate_name)
         form.addRow("Status", self.status)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addWidget(buttons)
+        _apply_language_to_widgets(self, self.language)
 
     def data(self):
         return {
             "title": self.title.text().strip(),
             "meeting_time": self.meeting_time.text().strip(),
-            "mentor_name": self.mentor_name.text().strip() or "Community team",
-            "resident_name": self.resident_name.currentData() or "",
-            "status": self.status.currentText(),
+            "mentor_name": self.mentor_name.currentText().strip(),
+            "resident_name": self.candidate_name.currentData() or "",
+            "status": self.status.currentData(_SOURCE_TEXT_ROLE),
         }
 
 
 class MessageDialog(QDialog):
     def __init__(self, recipients, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("New message")
+        self.language = _CURRENT_LANGUAGE
+        self.setStyleSheet(_localized_stylesheet())
+        self.setWindowTitle(translate("New message", self.language))
         self.setMinimumSize(500, 390)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 20)
@@ -307,12 +722,15 @@ class MessageDialog(QDialog):
         self.error_label = QLabel("")
         self.error_label.setObjectName("errorMessage")
         layout.addWidget(self.error_label)
+        _apply_language_to_widgets(self, self.language)
 
     def _accept_if_valid(self):
         if not self.recipient.currentData():
-            self.error_label.setText("Choose a recipient.")
+            self.error_label.setText(translate("Choose a recipient.", self.language))
         elif not self.subject.text().strip() or not self.body.toPlainText().strip():
-            self.error_label.setText("Add a subject and message before sending.")
+            self.error_label.setText(
+                translate("Add a subject and message before sending.", self.language)
+            )
         else:
             self.accept()
 
@@ -327,7 +745,11 @@ class MessageDialog(QDialog):
 class ResidentDialog(QDialog):
     def __init__(self, record=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Resident" if record is None else "Edit Resident")
+        self.language = _CURRENT_LANGUAGE
+        self.setStyleSheet(_localized_stylesheet())
+        self.setWindowTitle(
+            translate("Resident" if record is None else "Edit Resident", self.language)
+        )
         self.resize(450, 340)
 
         self.name = QLineEdit(record["name"] if record else "")
@@ -347,6 +769,7 @@ class ResidentDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addWidget(buttons)
+        _apply_language_to_widgets(self, self.language)
 
     def data(self):
         return {
@@ -405,22 +828,27 @@ class AvatarCard(QFrame):
 
 
 class WeRhereMainWindow(QMainWindow):
-    def __init__(self, user):
+    def __init__(self, user, language: str = "en"):
         super().__init__()
         _register_windows_font()
+        self.language = language if language in {code for _name, code in LANGUAGES} else "en"
+        global _CURRENT_LANGUAGE
+        _CURRENT_LANGUAGE = self.language
+        self.settings = QSettings("WeRhere", "CommunityWorkspace")
+        self.settings.setValue("language", self.language)
         self.username = user["username"]
         self.display_name = user["display_name"] or self.username
         self.role = user["role"]
         self.is_admin = self.role == "admin"
         self.db = initialize_database()
         self.setWindowTitle(
-            "WeRhere | Community workspace"
+            translate("WeRhere | VIT applicant CRM", self.language)
         )
         self.resize(1440, 920)
         self.setMinimumSize(1120, 720)
-        style_path = Path(__file__).with_name("styles.qss")
-        self.setStyleSheet(style_path.read_text(encoding="utf-8"))
+        self.setStyleSheet(_localized_stylesheet())
         self._build_ui()
+        _apply_language_to_widgets(self, self.language)
 
     def _build_ui(self):
         self.sidebar = QWidget()
@@ -432,25 +860,31 @@ class WeRhereMainWindow(QMainWindow):
 
         logo = BrandLogoWidget(184, 54)
         sidebar_layout.addWidget(logo)
+        self.language_selector = QComboBox()
+        self.language_selector.setObjectName("languageSelector")
+        for name, code in LANGUAGES:
+            self.language_selector.addItem(f"{code.upper()}  ·  {name}", code)
+        self.language_selector.setCurrentIndex(
+            max(0, self.language_selector.findData(self.language))
+        )
+        self.language_selector.currentIndexChanged.connect(self._change_language)
+        sidebar_layout.addWidget(self.language_selector)
 
         self.nav_buttons = {}
         if self.is_admin:
             self.page_builders = [
-                ("Dashboard", self._build_dashboard_page),
                 ("Applications", self._build_applications_page),
-                ("Mentor sessions", self._build_meetings_page),
-                ("Residents", self._build_residents_page),
-                ("Messages", self._build_messages_page),
-                ("Settings", self._build_settings_page),
+                ("Mentor interviews", self._build_meetings_page),
+                ("Mentors", self._build_mentors_page),
+                ("Interviews", self._build_residents_page),
+                ("Admin", self._build_settings_page),
             ]
         else:
             self.page_builders = [
-                ("My overview", self._build_resident_dashboard_page),
-                ("My application", self._build_resident_application_page),
-                ("Shared schedule", self._build_resident_meetings_page),
-                ("Messages", self._build_messages_page),
-                ("Support", self._build_resident_support_page),
-                ("Settings", self._build_settings_page),
+                ("Applications", self._build_applications_page),
+                ("Mentor interviews", self._build_meetings_page),
+                ("Mentors", self._build_mentors_page),
+                ("Interviews", self._build_residents_page),
             ]
 
         for index, (name, _) in enumerate(self.page_builders):
@@ -461,7 +895,7 @@ class WeRhereMainWindow(QMainWindow):
             sidebar_layout.addWidget(btn)
 
         sidebar_layout.addStretch()
-        role_label = QLabel("ADMINISTRATOR" if self.is_admin else "RESIDENT")
+        role_label = QLabel("ADMINISTRATOR" if self.is_admin else "USER")
         role_label.setObjectName("roleBadge")
         user_label = QLabel(self.display_name)
         user_label.setObjectName("sidebarUser")
@@ -480,6 +914,20 @@ class WeRhereMainWindow(QMainWindow):
         central_layout.addWidget(self.stack)
         self.setCentralWidget(central)
         self._switch_page(0)
+
+    def _change_language(self, _index: int) -> None:
+        self.language = self.language_selector.currentData()
+        global _CURRENT_LANGUAGE
+        _CURRENT_LANGUAGE = self.language
+        self.settings.setValue("language", self.language)
+        self._refresh_applications()
+        self._refresh_meetings()
+        self._refresh_mentors()
+        self._refresh_interviews()
+        self.setWindowTitle(
+            translate("WeRhere | VIT applicant CRM", self.language)
+        )
+        _apply_language_to_widgets(self, self.language)
 
     def _switch_page(self, index: int):
         self.stack.setCurrentIndex(index)
@@ -516,6 +964,7 @@ class WeRhereMainWindow(QMainWindow):
             text.strip().lower(), ("#edf0f4", "#687588")
         )
         item = QTableWidgetItem(text)
+        item.setData(_SOURCE_TEXT_ROLE, text)
         item.setBackground(QColor(background))
         item.setForeground(QColor(foreground))
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -539,27 +988,35 @@ class WeRhereMainWindow(QMainWindow):
     def _build_dashboard_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(30, 26, 30, 26)
-        layout.setSpacing(20)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
 
-        header_row = QHBoxLayout()
-        header_text = QVBoxLayout()
-        header = QLabel(f"Good to see you, {self.display_name}")
-        header.setObjectName("pageTitle")
-        subtitle = QLabel("Here’s what’s happening across your community today.")
-        subtitle.setObjectName("pageSubtitle")
-        header_text.addWidget(header)
-        header_text.addWidget(subtitle)
-        header_row.addLayout(header_text)
-        header_row.addStretch()
+        hero = QFrame()
+        hero.setObjectName("dashboardHero")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(24, 18, 24, 18)
+        hero_layout.setSpacing(18)
+        hero_text = QVBoxLayout()
+        hero_text.setSpacing(5)
+        header = QLabel(f"Welcome back, {self.display_name}")
+        header.setObjectName("dashboardHeroTitle")
+        subtitle = QLabel(
+            "Your community at a glance. Here are the updates that need your attention."
+        )
+        subtitle.setObjectName("dashboardHeroSubtitle")
+        subtitle.setWordWrap(True)
+        hero_text.addWidget(header)
+        hero_text.addWidget(subtitle)
+        hero_layout.addLayout(hero_text, 1)
         new_application = QPushButton("+  New application")
-        new_application.setObjectName("primaryButton")
+        new_application.setObjectName("heroButton")
         new_application.clicked.connect(self._add_application)
-        header_row.addWidget(new_application)
-        layout.addLayout(header_row)
+        new_application.setMinimumHeight(44)
+        hero_layout.addWidget(new_application)
+        layout.addWidget(hero)
 
         stats_layout = QHBoxLayout()
-        stats_layout.setSpacing(14)
+        stats_layout.setSpacing(12)
         stats = self.db.dashboard_stats()
         self.application_metric = DashboardCard(
             "Applications", str(stats["applications_total"]), "Across all programmes", "#cf4f4b"
@@ -649,11 +1106,22 @@ class WeRhereMainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(20)
+        layout.setSpacing(16)
 
+        hero = QFrame()
+        hero.setObjectName("dashboardHero")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(24, 18, 24, 18)
+        hero_layout.setSpacing(5)
         welcome = QLabel(f"Welcome, {self.display_name}")
-        welcome.setObjectName("pageTitle")
-        layout.addWidget(welcome)
+        welcome.setObjectName("dashboardHeroTitle")
+        hero_subtitle = QLabel(
+            "Pick up where you left off and see what is coming up."
+        )
+        hero_subtitle.setObjectName("dashboardHeroSubtitle")
+        hero_layout.addWidget(welcome)
+        hero_layout.addWidget(hero_subtitle)
+        layout.addWidget(hero)
 
         application = self.db.get_resident_application(self.display_name)
         meetings = [
@@ -711,22 +1179,53 @@ class WeRhereMainWindow(QMainWindow):
             no_application.setWordWrap(True)
             progress_layout.addWidget(no_application)
 
-        support_panel = QWidget()
-        support_panel.setObjectName("panel")
-        support_layout = QVBoxLayout(support_panel)
-        support_title = QLabel("You’re not on your own")
-        support_title.setObjectName("panelTitle")
-        support_layout.addWidget(support_title)
-        support_text = QLabel(
-            "WeRhere keeps your application update, shared schedule, and support "
-            "guidance together. If a status or next step is unclear, open Support "
-            "to see how to reach your coordinator."
-        )
-        support_text.setObjectName("supportNote")
-        support_text.setWordWrap(True)
-        support_layout.addWidget(support_text)
+        upcoming_panel = QWidget()
+        upcoming_panel.setObjectName("panel")
+        upcoming_layout = QVBoxLayout(upcoming_panel)
+        upcoming_header = QHBoxLayout()
+        upcoming_title = QLabel("Upcoming sessions")
+        upcoming_title.setObjectName("panelTitle")
+        upcoming_header.addWidget(upcoming_title)
+        upcoming_header.addStretch()
+        view_schedule = QPushButton("View schedule")
+        view_schedule.setObjectName("textButton")
+        view_schedule.clicked.connect(lambda: self._switch_page(2))
+        upcoming_header.addWidget(view_schedule)
+        upcoming_layout.addLayout(upcoming_header)
+        upcoming_meetings = sorted(
+            (
+                meeting
+                for meeting in meetings
+                if self._is_upcoming_meeting(meeting)
+            ),
+            key=lambda meeting: meeting["meeting_time"],
+        )[:3]
+        if upcoming_meetings:
+            for meeting in upcoming_meetings:
+                event = QFrame()
+                event.setObjectName("eventRow")
+                event_layout = QVBoxLayout(event)
+                event_layout.setContentsMargins(12, 9, 12, 9)
+                event_layout.setSpacing(3)
+                event_title = QLabel(meeting["title"])
+                event_title.setObjectName("eventTitle")
+                event_time = QLabel(
+                    f"{meeting['meeting_time']}  ·  "
+                    f"{meeting.get('mentor_name') or 'Community team'}"
+                )
+                event_time.setObjectName("pageSubtitle")
+                event_layout.addWidget(event_title)
+                event_layout.addWidget(event_time)
+                upcoming_layout.addWidget(event)
+        else:
+            empty_sessions = QLabel(
+                "No sessions are scheduled yet. New shared sessions will appear here."
+            )
+            empty_sessions.setObjectName("supportNote")
+            empty_sessions.setWordWrap(True)
+            upcoming_layout.addWidget(empty_sessions)
         content.addWidget(progress_panel, 1)
-        content.addWidget(support_panel, 1)
+        content.addWidget(upcoming_panel, 1)
         layout.addLayout(content)
 
         journey_panel = QWidget()
@@ -976,48 +1475,75 @@ class WeRhereMainWindow(QMainWindow):
         title_group = QVBoxLayout()
         header = QLabel("Applications")
         header.setObjectName("pageTitle")
-        subtitle = QLabel("Review, search and manage resident applications.")
+        subtitle = QLabel(
+            "Search the VIT applicant register and review mentor assignment and application status."
+        )
         subtitle.setObjectName("pageSubtitle")
         title_group.addWidget(header)
         title_group.addWidget(subtitle)
         header_row.addLayout(title_group)
         header_row.addStretch()
-        add_btn = QPushButton("+  New application")
-        add_btn.setObjectName("primaryButton")
-        add_btn.clicked.connect(self._add_application)
-        header_row.addWidget(add_btn)
         layout.addLayout(header_row)
 
         toolbar = QHBoxLayout()
         self.application_search = QLineEdit()
-        self.application_search.setPlaceholderText(
-            "Search by name, accommodation or location"
-        )
+        self.application_search.setPlaceholderText("Search applicants by name or keyword")
         self.application_search.textChanged.connect(self._refresh_applications)
         toolbar.addWidget(self.application_search)
-        self.application_status_filter = QComboBox()
-        self.application_status_filter.addItems(
-            ["All statuses", "Pending", "In review", "Approved", "Needs follow-up"]
-        )
-        self.application_status_filter.currentTextChanged.connect(
+        self.application_filter = QComboBox()
+        for label, value in (
+            ("All applications", "all"),
+            ("Mentor meeting identified", "mentor_identified"),
+            ("Mentor meeting not identified", "mentor_not_identified"),
+            ("Duplicate records (name + email)", "duplicates"),
+            ("Filter duplicate names (keep one)", "unique_names"),
+        ):
+            self.application_filter.addItem(label, value)
+            self.application_filter.setItemData(
+                self.application_filter.count() - 1, label, _SOURCE_TEXT_ROLE
+            )
+        self.application_filter.currentIndexChanged.connect(
             self._refresh_applications
         )
-        toolbar.addWidget(self.application_status_filter)
-        edit_btn = QPushButton("Edit")
-        edit_btn.clicked.connect(self._edit_application)
-        delete_btn = QPushButton("Delete")
-        delete_btn.setObjectName("dangerButton")
-        delete_btn.clicked.connect(self._delete_application)
+        toolbar.addWidget(self.application_filter)
+        add_btn = QPushButton("+  New applicant")
+        add_btn.setObjectName("primaryButton")
+        add_btn.clicked.connect(self._add_applicant)
+        edit_btn = QPushButton("Edit selected")
+        edit_btn.clicked.connect(self._edit_applicant)
+        email_btn = QPushButton("Email candidate")
+        email_btn.clicked.connect(self._email_selected_applicant)
+        toolbar.addWidget(add_btn)
         toolbar.addWidget(edit_btn)
-        toolbar.addWidget(delete_btn)
+        toolbar.addWidget(email_btn)
         layout.addLayout(toolbar)
 
         self.application_count = QLabel("")
         self.application_count.setObjectName("pageSubtitle")
         layout.addWidget(self.application_count)
-        self.application_table = QTableWidget(0, 8)
+        source_note = QLabel(
+            "Previous VIT comparison is unavailable: this Drive dataset contains VIT3 "
+            "applications, but no VIT1 or VIT2 workbook."
+        )
+        source_note.setObjectName("supportNote")
+        source_note.setWordWrap(True)
+        layout.addWidget(source_note)
+
+        self.application_table = QTableWidget(0, 11)
         self.application_table.setHorizontalHeaderLabels(
-            ["ID", "Applicant", "Accommodation", "Location", "Status", "Priority", "Updated", "Record check"]
+            [
+                "Source Row",
+                "#",
+                "Full Name",
+                "Email",
+                "Phone",
+                "Desired Training",
+                "Province",
+                "Current Status (source)",
+                "Mentor Meeting",
+                "Application Period",
+                "Processing Status",
+            ]
         )
         self.application_table.setColumnHidden(0, True)
         self.application_table.setAlternatingRowColors(True)
@@ -1025,11 +1551,20 @@ class WeRhereMainWindow(QMainWindow):
         self.application_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.application_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.application_table.verticalHeader().setVisible(False)
-        self.application_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        self.application_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.application_table.horizontalHeader().setStretchLastSection(True)
+        self.application_table.currentCellChanged.connect(
+            self._show_application_details
+        )
         layout.addWidget(self.application_table)
+
+        self.application_details = QTextEdit()
+        self.application_details.setReadOnly(True)
+        self.application_details.setMaximumHeight(180)
+        self.application_details.setPlaceholderText(
+            "Select an application to review all source fields."
+        )
+        layout.addWidget(self.application_details)
         self._refresh_applications()
         return page
 
@@ -1038,34 +1573,69 @@ class WeRhereMainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(30, 26, 30, 26)
         layout.setSpacing(16)
-        header = QLabel("Mentor sessions")
+        header = QLabel("Mentor interviews")
         header.setObjectName("pageTitle")
         layout.addWidget(header)
-        subtitle = QLabel("Plan interviews, follow-ups and community check-ins.")
+        subtitle = QLabel(
+            "Review all recorded candidate conversations, scores, recommendations, and notes."
+        )
         subtitle.setObjectName("pageSubtitle")
         layout.addWidget(subtitle)
 
         toolbar = QHBoxLayout()
         self.meeting_search = QLineEdit()
-        self.meeting_search.setPlaceholderText("Search sessions, mentors or residents")
+        self.meeting_search.setPlaceholderText("Search candidates, mentors, or notes")
         self.meeting_search.textChanged.connect(self._refresh_meetings)
         toolbar.addWidget(self.meeting_search)
-        add_btn = QPushButton("+  Schedule session")
-        add_btn.setObjectName("primaryButton")
-        add_btn.clicked.connect(self._add_meeting)
-        edit_btn = QPushButton("Edit")
-        edit_btn.clicked.connect(self._edit_meeting)
-        delete_btn = QPushButton("Delete")
-        delete_btn.setObjectName("dangerButton")
-        delete_btn.clicked.connect(self._delete_meeting)
-        toolbar.addWidget(add_btn)
-        toolbar.addWidget(edit_btn)
-        toolbar.addWidget(delete_btn)
+        self.mentor_recommendation_filter = QComboBox()
+        self.mentor_recommendation_filter.addItem("All conversations", "")
+        self.mentor_recommendation_filter.setItemData(
+            0, "All conversations", _SOURCE_TEXT_ROLE
+        )
+        for record in self.db.list_source_records(
+            "Mentor", "Mentor Recommendation Options"
+        ):
+            values = dict(zip(record["headers"], record["values"]))
+            option = next(iter(values.values()), None)
+            if option:
+                self.mentor_recommendation_filter.addItem(str(option), str(option))
+                self.mentor_recommendation_filter.setItemData(
+                    self.mentor_recommendation_filter.count() - 1,
+                    str(option),
+                    _SOURCE_TEXT_ROLE,
+                )
+        self.mentor_recommendation_filter.currentIndexChanged.connect(
+            self._refresh_meetings
+        )
+        toolbar.addWidget(self.mentor_recommendation_filter)
+        schedule_btn = QPushButton("+  Schedule interview")
+        schedule_btn.setObjectName("primaryButton")
+        schedule_btn.clicked.connect(self._schedule_mentor_interview)
+        edit_schedule_btn = QPushButton("Edit selected appointment")
+        edit_schedule_btn.clicked.connect(self._edit_mentor_interview)
+        toolbar.addWidget(schedule_btn)
+        toolbar.addWidget(edit_schedule_btn)
         layout.addLayout(toolbar)
 
-        self.meeting_table = QTableWidget(0, 6)
+        self.mentor_count = QLabel("")
+        self.mentor_count.setObjectName("pageSubtitle")
+        layout.addWidget(self.mentor_count)
+        self.meeting_table = QTableWidget(0, 12)
         self.meeting_table.setHorizontalHeaderLabels(
-            ["ID", "Session", "Date and time", "Mentor", "Resident", "Status"]
+            [
+                "Meeting ID",
+                "#",
+                "Candidate Name",
+                "Date and time",
+                "VIT Group",
+                "Mentor Name",
+                "Score",
+                "Recommendation",
+                "Alternative Recommendation",
+                "Secondary Score",
+                "Notes",
+                "Appointment Status",
+            ]
         )
         self.meeting_table.setColumnHidden(0, True)
         self.meeting_table.setAlternatingRowColors(True)
@@ -1073,91 +1643,117 @@ class WeRhereMainWindow(QMainWindow):
         self.meeting_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.meeting_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.meeting_table.verticalHeader().setVisible(False)
-        self.meeting_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        self.meeting_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.meeting_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.meeting_table)
         self._refresh_meetings()
         return page
 
-    def _build_residents_page(self):
+    def _build_mentors_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setContentsMargins(30, 26, 30, 26)
         layout.setSpacing(16)
-        header = QLabel("Residents")
+
+        header = QLabel("Mentors")
         header.setObjectName("pageTitle")
         layout.addWidget(header)
-        subtitle = QLabel(
-            "Find residents and review their accommodation, application progress, "
-            "and assigned support sessions."
-        )
+        subtitle = QLabel("Mentors who appear in recorded or scheduled interviews.")
         subtitle.setObjectName("pageSubtitle")
         layout.addWidget(subtitle)
 
-        metrics = QHBoxLayout()
-        metrics.setSpacing(14)
-        self.residents_total_card = DashboardCard(
-            "Resident records", "0", "People in the resident directory", "#7084bb"
+        self.mentor_search = QLineEdit()
+        self.mentor_search.setPlaceholderText("Search mentors")
+        self.mentor_search.textChanged.connect(self._refresh_mentors)
+        layout.addWidget(self.mentor_search)
+
+        self.mentor_directory_count = QLabel("")
+        self.mentor_directory_count.setObjectName("pageSubtitle")
+        layout.addWidget(self.mentor_directory_count)
+
+        self.mentor_directory_table = QTableWidget(0, 3)
+        self.mentor_directory_table.setHorizontalHeaderLabels(
+            ["#", "Mentor", "Interviews"]
         )
-        self.residents_applications_card = DashboardCard(
-            "Linked applications", "0", "Resident records with an application", "#4f9c9b"
+        self.mentor_directory_table.setAlternatingRowColors(True)
+        self.mentor_directory_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
         )
-        self.residents_sessions_card = DashboardCard(
-            "Assigned sessions", "0", "Sessions linked to a resident", "#dc9a37"
+        self.mentor_directory_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
         )
-        for card in (
-            self.residents_total_card,
-            self.residents_applications_card,
-            self.residents_sessions_card,
-        ):
-            metrics.addWidget(card)
-        layout.addLayout(metrics)
+        self.mentor_directory_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.mentor_directory_table.verticalHeader().setVisible(False)
+        self.mentor_directory_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.mentor_directory_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.mentor_directory_table)
+        self._refresh_mentors()
+        return page
+
+    def _build_residents_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 26, 30, 26)
+        layout.setSpacing(16)
+        header = QLabel("Interviews")
+        header.setObjectName("pageTitle")
+        layout.addWidget(header)
+        subtitle = QLabel("Track projects sent to candidates and received back.")
+        subtitle.setObjectName("pageSubtitle")
+        layout.addWidget(subtitle)
 
         toolbar = QHBoxLayout()
-        self.resident_search = QLineEdit()
-        self.resident_search.setPlaceholderText("Search by resident or accommodation")
-        self.resident_search.textChanged.connect(self._refresh_residents)
-        toolbar.addWidget(self.resident_search)
-        add_btn = QPushButton("+  Add resident")
-        add_btn.setObjectName("primaryButton")
-        add_btn.clicked.connect(self._add_resident)
-        edit_btn = QPushButton("Edit selected")
-        edit_btn.clicked.connect(self._edit_resident)
-        delete_btn = QPushButton("Delete selected")
-        delete_btn.setObjectName("dangerButton")
-        delete_btn.clicked.connect(self._delete_resident)
-        toolbar.addWidget(add_btn)
-        toolbar.addWidget(edit_btn)
-        toolbar.addWidget(delete_btn)
+        self.interview_search = QLineEdit()
+        self.interview_search.setPlaceholderText("Search candidates")
+        self.interview_search.textChanged.connect(self._refresh_interviews)
+        toolbar.addWidget(self.interview_search)
+        self.interview_filter_value = "all"
+        self.interview_filter_buttons = {}
+        for label, value in (
+            ("All candidates", "all"),
+            ("Projects sent", "sent"),
+            ("Projects received", "received"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("interviewFilterButton")
+            button.setCheckable(True)
+            button.setChecked(value == self.interview_filter_value)
+            button.clicked.connect(
+                lambda _checked, selected=value: self._set_interview_filter(selected)
+            )
+            self.interview_filter_buttons[value] = button
+            toolbar.addWidget(button)
         layout.addLayout(toolbar)
 
-        self.resident_table = QTableWidget(0, 5)
-        self.resident_table.setHorizontalHeaderLabels(
-            ["ID", "Resident", "Accommodation", "Application", "Next session"]
+        self.interview_count = QLabel("")
+        self.interview_count.setObjectName("pageSubtitle")
+        layout.addWidget(self.interview_count)
+        self.interview_table = QTableWidget(0, 4)
+        self.interview_table.setHorizontalHeaderLabels(
+            ["#", "Full Name", "Project sent", "Project received"]
         )
-        self.resident_table.setAlternatingRowColors(True)
-        self.resident_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.resident_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.resident_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.resident_table.verticalHeader().setVisible(False)
-        self.resident_table.horizontalHeader().setSectionResizeMode(
+        self.interview_table.setAlternatingRowColors(True)
+        self.interview_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.interview_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.interview_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.interview_table.verticalHeader().setVisible(False)
+        self.interview_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
-        self.resident_table.horizontalHeader().setStretchLastSection(True)
-        self.resident_table.setColumnHidden(0, True)
-        self.resident_table.setIconSize(QSize(34, 34))
-        self.resident_table.verticalHeader().setDefaultSectionSize(54)
-        layout.addWidget(self.resident_table)
-        self.residents_empty_state = QLabel()
-        self.residents_empty_state.setObjectName("emptyState")
-        self.residents_empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.residents_empty_state.setWordWrap(True)
-        self.residents_empty_state.hide()
-        layout.addWidget(self.residents_empty_state)
-        self._refresh_residents()
+        self.interview_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.interview_table)
+        self._refresh_interviews()
         return page
+
+    def _set_interview_filter(self, selected_filter: str) -> None:
+        self.interview_filter_value = selected_filter
+        for value, button in self.interview_filter_buttons.items():
+            button.setChecked(value == selected_filter)
+        self._refresh_interviews()
 
     def _refresh_messages(self):
         messages = self.db.list_messages(self.username)
@@ -1188,6 +1784,7 @@ class WeRhereMainWindow(QMainWindow):
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)
                 if column == 1:
+                    cell.setData(_SOURCE_TEXT_ROLE, value)
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     cell.setForeground(QColor("#2f6e9f" if incoming else "#687588"))
                 if column == 2 and incoming and not message["is_read"]:
@@ -1195,6 +1792,7 @@ class WeRhereMainWindow(QMainWindow):
                     font.setWeight(QFont.Weight.Bold)
                     cell.setFont(font)
                 self.message_table.setItem(row_index, column, cell)
+        _apply_language_to_widgets(self, self.language)
 
     def _show_selected_message(
         self,
@@ -1224,15 +1822,24 @@ class WeRhereMainWindow(QMainWindow):
             other_user,
         )
         self.message_preview_title.setText(message["subject"])
-        self.message_preview_from.setText(
-            f"From {other_user}" if incoming else f"To {other_user}"
+        preview_source = f"From {other_user}" if incoming else f"To {other_user}"
+        preview_text = translate(preview_source, self.language)
+        self.message_preview_from.setProperty(
+            "languageSourceText", preview_source
         )
+        self.message_preview_from.setProperty(
+            "languageSourceTextApplied", preview_text
+        )
+        self.message_preview_from.setText(preview_text)
         self.message_preview_body.setText(message["body"])
         if incoming and not message["is_read"]:
             self.db.mark_message_read(message["id"], self.username)
             message["is_read"] = 1
-            self.message_table.item(row, 1).setText("Received")
+            direction_item = self.message_table.item(row, 1)
+            direction_item.setData(_SOURCE_TEXT_ROLE, "Received")
+            direction_item.setText(translate("Received", self.language))
             self.message_table.item(row, 2).setFont(QFont())
+        _apply_language_to_widgets(self, self.language)
 
     def _compose_message(self):
         recipient_role = "resident" if self.is_admin else "admin"
@@ -1254,14 +1861,18 @@ class WeRhereMainWindow(QMainWindow):
                 message["body"],
             )
             self._refresh_messages()
-            QMessageBox.information(self, "Message sent", "Your message has been sent.")
+            QMessageBox.information(
+                self,
+                translate("Message sent", self.language),
+                translate("Your message has been sent.", self.language),
+            )
 
     def _build_settings_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(30, 28, 30, 28)
         layout.setSpacing(18)
-        header = QLabel("Settings")
+        header = QLabel("Admin" if self.is_admin else "Settings")
         header.setObjectName("pageTitle")
         layout.addWidget(header)
         subtitle = QLabel(
@@ -1302,16 +1913,16 @@ class WeRhereMainWindow(QMainWindow):
         access_title = QLabel("Your access")
         access_title.setObjectName("panelTitle")
         access_layout.addWidget(access_title)
-        role_name = "Administrator" if self.is_admin else "Resident"
+        role_name = "Administrator" if self.is_admin else "User"
         role_badge = QLabel(role_name)
         role_badge.setObjectName("roleBadge")
         role_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         role_badge.setMaximumWidth(150)
         access_layout.addWidget(role_badge, alignment=Qt.AlignmentFlag.AlignLeft)
         access_description = QLabel(
-            "Manage applications, mentor sessions, resident records, and messages."
+            "Review the application, mentor interview, and project interview workbooks."
             if self.is_admin
-            else "View your own application, shared schedule, support guidance, and messages."
+            else "Review candidate applications, mentor interviews, and project interviews."
         )
         access_description.setObjectName("pageSubtitle")
         access_description.setWordWrap(True)
@@ -1326,7 +1937,8 @@ class WeRhereMainWindow(QMainWindow):
         workspace_layout.addWidget(workspace_title)
         workspace_description = QLabel(
             "This desktop workspace stores its records in a local SQLite database. "
-            "It does not sync messages or data to a hosted service."
+            "Workbook data is a local snapshot and does not sync back to Google Drive. "
+            "Google Calendar event capture and email sending are not configured."
         )
         workspace_description.setObjectName("pageSubtitle")
         workspace_description.setWordWrap(True)
@@ -1392,7 +2004,9 @@ class WeRhereMainWindow(QMainWindow):
             name = QLabel(application["applicant_name"])
             name.setObjectName("eventTitle")
             detail = QLabel(
-                f"{application['location']}  ·  {application['priority']} priority"
+                f"{application['location']}  ·  "
+                f"{translate(application['priority'], self.language)} "
+                f"{translate('Priority', self.language)}"
             )
             detail.setObjectName("pageSubtitle")
             row_layout.addWidget(name)
@@ -1409,7 +2023,12 @@ class WeRhereMainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
         upcoming = sorted(
-            self.db.list_meetings(), key=lambda meeting: meeting["meeting_time"]
+            (
+                meeting
+                for meeting in self.db.list_meetings()
+                if self._is_upcoming_meeting(meeting)
+            ),
+            key=lambda meeting: meeting["meeting_time"],
         )[:4]
         if not upcoming:
             empty = QLabel("No sessions scheduled yet.")
@@ -1428,171 +2047,517 @@ class WeRhereMainWindow(QMainWindow):
             event_layout.addWidget(event_title)
             event_layout.addWidget(event_time)
             self.upcoming_list.addWidget(event)
+        _apply_language_to_widgets(self, self.language)
 
-    def _refresh_applications(self, _value: str = ""):
-        query = self.application_search.text().strip()
-        status_filter = self.application_status_filter.currentText()
-        rows = self.db.list_applications(query)
-        if status_filter != "All statuses":
-            rows = [row for row in rows if row["status"] == status_filter]
-        names = Counter(
-            item["applicant_name"].strip().casefold()
-            for item in self.db.list_applications()
+    @staticmethod
+    def _source_record_values(record):
+        return dict(zip(record["headers"], record["values"]))
+
+    @staticmethod
+    def _source_value(record, field: str) -> str:
+        value = record.get(field)
+        return "" if value is None else str(value).strip()
+
+    def _refresh_applications(self, _value=None):
+        raw_records = self.db.list_source_records("Applications", "Applications")
+        all_records = [
+            {**record, "fields": self._source_record_values(record)}
+            for record in raw_records
+        ]
+        records = list(all_records)
+        query = self.application_search.text().strip().casefold()
+        if query:
+            records = [
+                record
+                for record in records
+                if any(
+                    query in str(value or "").casefold()
+                    for value in record["fields"].values()
+                )
+            ]
+
+        duplicate_keys = Counter(
+            (
+                self._source_value(record["fields"], "Full Name").casefold(),
+                self._source_value(record["fields"], "Email").casefold(),
+            )
+            for record in all_records
+            if self._source_value(record["fields"], "Full Name")
+            and self._source_value(record["fields"], "Email")
         )
+        selected_filter = self.application_filter.currentData()
+        if selected_filter == "mentor_identified":
+            records = [
+                record
+                for record in records
+                if self._source_value(
+                    record["fields"], "Mentor Meeting"
+                ).casefold() == "ok"
+            ]
+        elif selected_filter == "mentor_not_identified":
+            records = [
+                record
+                for record in records
+                if self._source_value(
+                    record["fields"], "Mentor Meeting"
+                ).casefold()
+                == "not assigned"
+            ]
+        elif selected_filter == "duplicates":
+            records = [
+                record
+                for record in records
+                if duplicate_keys[
+                    (
+                        self._source_value(record["fields"], "Full Name").casefold(),
+                        self._source_value(record["fields"], "Email").casefold(),
+                    )
+                ]
+                > 1
+                and self._source_value(record["fields"], "Full Name")
+                and self._source_value(record["fields"], "Email")
+            ]
+        elif selected_filter == "unique_names":
+            unique_records = []
+            seen_names = set()
+            for record in records:
+                name = self._source_value(record["fields"], "Full Name").casefold()
+                if not name or name not in seen_names:
+                    unique_records.append(record)
+                    if name:
+                        seen_names.add(name)
+            records = unique_records
+
+        self.application_visible_records = records
+        self.application_status_colors = {
+            self._source_value(record["fields"], "Full Name").casefold():
+            self._status_color(record["fields"])
+            for record in all_records
+        }
         self.application_count.setText(
-            f"{len(rows)} applications"
-            + (
-                f"  ·  {sum(count > 1 for count in names.values())} possible duplicate names"
-                if any(count > 1 for count in names.values())
-                else ""
+            translate("Showing {shown} of {total} candidates", self.language).format(
+                shown=len(records), total=len(all_records)
             )
         )
-        self.application_table.setRowCount(len(rows))
-        for row_index, item in enumerate(rows):
-            self.application_table.setItem(row_index, 0, QTableWidgetItem(str(item["id"])))
-            self.application_table.setItem(row_index, 1, QTableWidgetItem(item["applicant_name"]))
-            self.application_table.setItem(row_index, 2, QTableWidgetItem(item["type_name"]))
-            self.application_table.setItem(row_index, 3, QTableWidgetItem(item["location"]))
+        columns = (
+            "Full Name",
+            "Email",
+            "Phone",
+            "Desired Training",
+            "Province",
+            "Current Status",
+            "Mentor Meeting",
+            "Application Period",
+            "Processing Status",
+        )
+        self.application_table.setRowCount(len(records))
+        for row_index, record in enumerate(records):
             self.application_table.setItem(
-                row_index, 4, self._colored_item(item["status"])
+                row_index, 0, QTableWidgetItem(str(record["source_row"]))
             )
-            self.application_table.setItem(
-                row_index, 5, self._colored_item(item["priority"], "priority")
-            )
-            self.application_table.setItem(row_index, 6, QTableWidgetItem(item["last_update"]))
-            duplicate = names[item["applicant_name"].strip().casefold()] > 1
-            check = QTableWidgetItem("Review name" if duplicate else "No match")
-            check.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            check.setBackground(QColor("#fff4d8" if duplicate else "#e4f5ec"))
-            check.setForeground(QColor("#976b15" if duplicate else "#287a54"))
-            if duplicate:
-                check.setToolTip(
-                    "Another application has the same applicant name. Review before merging."
-                )
-            self.application_table.setItem(row_index, 7, check)
+            row_number = QTableWidgetItem(str(row_index + 1))
+            row_number.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.application_table.setItem(row_index, 1, row_number)
+            for column_index, column in enumerate(columns):
+                value = self._source_value(record["fields"], column)
+                if column == "Full Name":
+                    value = value.title()
+                item = QTableWidgetItem(value)
+                if column == "Current Status":
+                    item.setToolTip("Current Status (source)")
+                if column == "Full Name":
+                    item.setForeground(
+                        QColor(self._status_color(record["fields"]))
+                    )
+                    item.setFont(QFont(item.font().family(), item.font().pointSize(), QFont.Weight.Bold))
+                self.application_table.setItem(row_index, column_index + 2, item)
+        if records:
+            self._show_application_details(0, 0, -1, -1)
+        else:
+            self.application_details.clear()
+        _apply_language_to_widgets(self, self.language)
 
-    def _refresh_meetings(self, query: str = None):
-        if query is None:
-            query = self.meeting_search.text()
-        rows = self.db.list_meetings(query)
-        self.meeting_table.setRowCount(len(rows))
-        for row_index, item in enumerate(rows):
-            self.meeting_table.setItem(row_index, 0, QTableWidgetItem(str(item["id"])))
-            self.meeting_table.setItem(row_index, 1, QTableWidgetItem(item["title"]))
-            self.meeting_table.setItem(row_index, 2, QTableWidgetItem(item["meeting_time"]))
-            self.meeting_table.setItem(
-                row_index, 3, QTableWidgetItem(item.get("mentor_name") or "Community team")
-            )
-            self.meeting_table.setItem(
-                row_index, 4, QTableWidgetItem(item.get("resident_name", "") or "Not assigned")
-            )
-            self.meeting_table.setItem(
-                row_index, 5, self._colored_item(item["status"])
-            )
+    def _show_application_details(
+        self, row: int, _column: int, _previous_row: int, _previous_column: int
+    ):
+        if row < 0 or row >= len(getattr(self, "application_visible_records", [])):
+            return
+        record = self.application_visible_records[row]
+        details = []
+        for header, value in record["fields"].items():
+            if header == "Full Name" and value:
+                value = str(value).title()
+            details.append(f"{header}: {value if value is not None else ''}")
+        self.application_details.setPlainText("\n".join(details))
 
-    def _refresh_residents(self, query: str = None):
-        if query is None:
-            query = self.resident_search.text()
-        all_residents = self.db.list_residents()
-        applications = {}
-        for application in self.db.list_applications():
-            applications.setdefault(
-                application["applicant_name"].strip().casefold(), application
-            )
-        meetings_by_resident = {}
-        for meeting in sorted(
-            self.db.list_meetings(), key=lambda item: item["meeting_time"]
-        ):
-            resident_name = meeting.get("resident_name", "").strip().casefold()
-            if resident_name:
-                meetings_by_resident.setdefault(resident_name, meeting)
+    @staticmethod
+    def _status_color(record):
+        processing_status = WeRhereMainWindow._source_value(
+            record, "Processing Status"
+        ).casefold()
+        current_status = WeRhereMainWindow._source_value(
+            record, "Current Status"
+        ).casefold()
+        if processing_status == "done":
+            return "#287a54"
+        if "moved into housing" in current_status:
+            return "#2f6e9f"
+        if "waiting" in current_status:
+            return "#976b15"
+        return "#687588"
 
-        normalized_query = query.strip().casefold()
-        rows = [
-            resident
-            for resident in all_residents
-            if not normalized_query
-            or any(
-                normalized_query in str(value or "").casefold()
-                for value in (
-                    resident["name"],
-                    resident["role"],
-                    resident.get("description"),
-                    (
-                        applications.get(resident["name"].strip().casefold()) or {}
-                    ).get("type_name"),
-                    (
-                        applications.get(resident["name"].strip().casefold()) or {}
-                    ).get("status"),
-                )
+    def _candidate_names(self):
+        records = [
+            self._source_record_values(record)
+            for record in self.db.list_source_records(
+                "Applications", "Applications"
             )
         ]
-        application_count = sum(
-            resident["name"].strip().casefold() in applications
-            for resident in all_residents
+        return sorted(
+            {
+                self._source_value(record, "Full Name").title()
+                for record in records
+                if self._source_value(record, "Full Name")
+            },
+            key=str.casefold,
         )
-        assigned_session_count = sum(
-            resident["name"].strip().casefold() in meetings_by_resident
-            for resident in all_residents
+
+    def _mentor_names(self):
+        return [record["name"] for record in self._mentor_summaries()]
+
+    def _mentor_summaries(self):
+        summaries = {}
+
+        def add_mentor(name: str, count: int = 1) -> None:
+            name = name.strip()
+            if not name:
+                return
+            key = name.casefold()
+            summary = summaries.setdefault(
+                key, {"name": name, "interviews": 0}
+            )
+            summary["interviews"] += count
+
+        for record in self.db.list_source_records("Mentor", "Mentor"):
+            fields = self._source_record_values(record)
+            add_mentor(self._source_value(fields, "Mentor Name"))
+        for meeting in self.db.list_meetings():
+            if meeting["title"] == "Mentor interview":
+                add_mentor(meeting["mentor_name"])
+        return sorted(
+            summaries.values(), key=lambda record: record["name"].casefold()
         )
-        self.resident_table.setRowCount(len(rows))
-        for row_index, item in enumerate(rows):
-            self.resident_table.setItem(row_index, 0, QTableWidgetItem(str(item["id"])))
-            resident_name = item["name"]
-            name_item = QTableWidgetItem(resident_name)
-            avatar_color = QColor(item["color"])
-            if not avatar_color.isValid():
-                avatar_color = QColor("#DCE7F5")
-            initials = item.get("initials") or resident_name[:2].upper()
-            name_item.setIcon(
-                QIcon(AvatarCard._make_avatar(initials, avatar_color.name()))
-            )
-            self.resident_table.setItem(row_index, 1, name_item)
 
-            normalized_name = resident_name.strip().casefold()
-            application = applications.get(normalized_name)
-            if application:
-                accommodation = application["type_name"]
-                self.resident_table.setItem(
-                    row_index, 3, self._colored_item(application["status"])
-                )
-            else:
-                accommodation = item["role"]
-                self.resident_table.setItem(
-                    row_index, 3, QTableWidgetItem("No application linked")
-                )
-            self.resident_table.setItem(
-                row_index, 2, QTableWidgetItem(accommodation)
-            )
+    def _refresh_mentors(self, _value=None):
+        mentors = self._mentor_summaries()
+        total = len(mentors)
+        query = self.mentor_search.text().strip().casefold()
+        if query:
+            mentors = [
+                mentor for mentor in mentors
+                if query in mentor["name"].casefold()
+            ]
 
-            meeting = meetings_by_resident.get(normalized_name)
-            if meeting:
-                session_time = meeting["meeting_time"]
-                try:
-                    session_time = datetime.strptime(
-                        session_time, "%Y-%m-%d %H:%M"
-                    ).strftime("%d %b %Y, %H:%M")
-                except ValueError:
-                    pass
-                self.resident_table.setItem(
-                    row_index, 4, QTableWidgetItem(session_time)
-                )
-            else:
-                self.resident_table.setItem(
-                    row_index, 4, QTableWidgetItem("Not scheduled")
-                )
-
-        self.resident_table.setVisible(bool(rows))
-        self.residents_empty_state.setVisible(not rows)
-        if not rows:
-            self.residents_empty_state.setText(
-                "No residents match your search."
-                if normalized_query
-                else "No resident records yet. Use “Add resident” to create the first record."
+        self.mentor_directory_count.setText(
+            translate(
+                "Showing {shown} of {total} mentors", self.language
+            ).format(shown=len(mentors), total=total)
+        )
+        self.mentor_directory_table.setRowCount(len(mentors))
+        for row_index, mentor in enumerate(mentors):
+            number = QTableWidgetItem(str(row_index + 1))
+            number.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.mentor_directory_table.setItem(row_index, 0, number)
+            self.mentor_directory_table.setItem(
+                row_index, 1, QTableWidgetItem(mentor["name"])
             )
-        self.residents_total_card.set_value(str(len(all_residents)))
-        self.residents_applications_card.set_value(str(application_count))
-        self.residents_sessions_card.set_value(str(assigned_session_count))
+            self.mentor_directory_table.setItem(
+                row_index, 2, QTableWidgetItem(str(mentor["interviews"]))
+            )
+        _apply_language_to_widgets(self, self.language)
+
+    def _add_applicant(self):
+        records = self.db.list_source_records("Applications", "Applications")
+        if not records:
+            self._show_error("Application workbook source fields are unavailable.")
+            return
+        headers = records[0]["headers"]
+        dialog = ApplicationSourceDialog(headers, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.db.save_application_source_record(dialog.data())
+        except (ValueError, OSError) as error:
+            message = translate("Could not save the candidate: {error}", self.language)
+            self._show_error(message.format(error=error))
+            return
+        self._refresh_applications()
+        self._refresh_meetings()
+        self._refresh_interviews()
+
+    def _edit_applicant(self):
+        selected = self.application_table.selectionModel().selectedRows()
+        if not selected:
+            self._show_error("Please select an application first.")
+            return
+        row_index = selected[0].row()
+        record = self.application_visible_records[row_index]
+        dialog = ApplicationSourceDialog(
+            record["headers"], record["fields"], self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.db.save_application_source_record(
+                dialog.data(), source_row=record["source_row"]
+            )
+        except (ValueError, OSError) as error:
+            message = translate(
+                "Could not update the candidate: {error}", self.language
+            )
+            self._show_error(message.format(error=error))
+            return
+        self._refresh_applications()
+        self._refresh_meetings()
+        self._refresh_interviews()
+
+    def _email_selected_applicant(self):
+        selected = self.application_table.selectionModel().selectedRows()
+        if not selected:
+            self._show_error("Please select a candidate first.")
+            return
+        record = self.application_visible_records[selected[0].row()]["fields"]
+        email = self._source_value(record, "Email")
+        if not email:
+            self._show_error("The selected candidate has no email address.")
+            return
+        url = QUrl(
+            f"mailto:{quote(email, safe='@.+-_')}"
+            f"?subject={quote('VIT programme application', safe='')}"
+        )
+        if not QDesktopServices.openUrl(url):
+            self._show_error("Could not open the default email application.")
+
+    def _candidate_name_color(self, name: str) -> QColor:
+        return QColor(self.application_status_colors.get(name.strip().casefold(), "#687588"))
+
+    def _refresh_meetings(self, _value=None):
+        raw_records = self.db.list_source_records("Mentor", "Mentor")
+        records = [
+            {
+                "kind": "source",
+                "source_row": record["source_row"],
+                "fields": self._source_record_values(record),
+            }
+            for record in raw_records
+        ]
+        appointments = [
+            {
+                "kind": "appointment",
+                "meeting": meeting,
+                "fields": {
+                    "Candidate Name": meeting["resident_name"],
+                    "Date": meeting["meeting_time"],
+                    "VIT Group": "",
+                    "Mentor Name": meeting["mentor_name"],
+                    "Score": "",
+                    "Recommendation": "",
+                    "Alternative Recommendation": "",
+                    "Secondary Score": "",
+                    "Notes": "",
+                },
+            }
+            for meeting in self.db.list_meetings()
+            if meeting["title"] == "Mentor interview"
+        ]
+        records.extend(appointments)
+        query = self.meeting_search.text().strip().casefold()
+        recommendation = self.mentor_recommendation_filter.currentData()
+        if query:
+            records = [
+                record
+                for record in records
+                if any(
+                    query in str(value or "").casefold()
+                    for value in record["fields"].values()
+                )
+            ]
+        if recommendation:
+            records = [
+                record
+                for record in records
+                if self._source_value(
+                    record["fields"], "Recommendation"
+                ) == recommendation
+            ]
+
+        self.mentor_visible_records = records
+        self.mentor_count.setText(
+            translate("Showing {shown} of {total} mentor interviews", self.language).format(
+                shown=len(records), total=len(raw_records) + len(appointments)
+            )
+        )
+        columns = (
+            "Candidate Name",
+            "Date",
+            "VIT Group",
+            "Mentor Name",
+            "Score",
+            "Recommendation",
+            "Alternative Recommendation",
+            "Secondary Score",
+            "Notes",
+        )
+        self.meeting_table.setRowCount(len(records))
+        for row_index, record in enumerate(records):
+            meeting = record.get("meeting")
+            self.meeting_table.setItem(
+                row_index,
+                0,
+                QTableWidgetItem(str(meeting["id"]) if meeting else ""),
+            )
+            number_item = QTableWidgetItem(str(row_index + 1))
+            number_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.meeting_table.setItem(row_index, 1, number_item)
+            for column_index, column in enumerate(columns):
+                value = self._source_value(record["fields"], column)
+                if column == "Candidate Name" and value:
+                    value = value.title()
+                item = QTableWidgetItem(value)
+                if column == "Candidate Name":
+                    item.setForeground(self._candidate_name_color(value))
+                    item.setFont(
+                        QFont(
+                            item.font().family(),
+                            item.font().pointSize(),
+                            QFont.Weight.Bold,
+                        )
+                    )
+                elif column == "Date" and meeting is not None:
+                    item.setData(_SOURCE_TEXT_ROLE, "Date and time")
+                self.meeting_table.setItem(row_index, column_index + 2, item)
+            status = meeting["status"] if meeting else "Recorded"
+            self.meeting_table.setItem(
+                row_index, 11, self._colored_item(status)
+            )
+        _apply_language_to_widgets(self, self.language)
+
+    def _schedule_mentor_interview(self):
+        dialog = MeetingDialog(
+            candidates=self._candidate_names(),
+            mentors=self._mentor_names(),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        payload = dialog.data()
+        if not payload["resident_name"] or not payload["mentor_name"]:
+            self._show_error("Candidate and interviewer are required.")
+            return
+        if not self._valid_interview_datetime(payload["meeting_time"]):
+            self._show_error("Enter the interview date and time as YYYY-MM-DD HH:MM.")
+            return
+        self.db.add_meeting(payload)
+        self._refresh_meetings()
+        self._refresh_mentors()
+
+    def _edit_mentor_interview(self):
+        selected = self.meeting_table.selectionModel().selectedRows()
+        if not selected:
+            self._show_error("Please select an appointment first.")
+            return
+        row_index = selected[0].row()
+        entry = self.mentor_visible_records[row_index]
+        meeting = entry.get("meeting")
+        if meeting is None:
+            self._show_error("Only scheduled appointments can be edited here.")
+            return
+        dialog = MeetingDialog(
+            record=meeting,
+            candidates=self._candidate_names(),
+            mentors=self._mentor_names(),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        payload = dialog.data()
+        if not payload["resident_name"] or not payload["mentor_name"]:
+            self._show_error("Candidate and interviewer are required.")
+            return
+        if not self._valid_interview_datetime(payload["meeting_time"]):
+            self._show_error("Enter the interview date and time as YYYY-MM-DD HH:MM.")
+            return
+        self.db.update_meeting(meeting["id"], payload)
+        self._refresh_meetings()
+        self._refresh_mentors()
+
+    @staticmethod
+    def _valid_interview_datetime(value: str) -> bool:
+        try:
+            datetime.strptime(value, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return False
+        return True
+
+    def _refresh_interviews(self, _value=None):
+        raw_records = self.db.list_source_records("Interviews", "Interviews")
+        records = [self._source_record_values(record) for record in raw_records]
+        query = self.interview_search.text().strip().casefold()
+        selected_filter = self.interview_filter_value
+        if query:
+            records = [
+                record
+                for record in records
+                if any(query in str(value or "").casefold() for value in record.values())
+            ]
+        if selected_filter == "sent":
+            records = [
+                record
+                for record in records
+                if self._source_value(record, "Project Sent Date")
+            ]
+        elif selected_filter == "received":
+            records = [
+                record
+                for record in records
+                if self._source_value(record, "Project Received Date")
+            ]
+
+        self.interview_count.setText(
+            translate("Showing {shown} of {total} candidates", self.language).format(
+                shown=len(records), total=len(raw_records)
+            )
+        )
+        columns = ("Full Name", "Project Sent Date", "Project Received Date")
+        self.interview_table.setRowCount(len(records))
+        for row_index, record in enumerate(records):
+            number_item = QTableWidgetItem(str(row_index + 1))
+            number_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.interview_table.setItem(row_index, 0, number_item)
+            for column_index, column in enumerate(columns):
+                value = self._source_value(record, column)
+                if column == "Full Name" and value:
+                    value = value.title()
+                item = QTableWidgetItem(value)
+                if column == "Project Sent Date":
+                    item.setData(_SOURCE_TEXT_ROLE, "Project sent")
+                elif column == "Project Received Date":
+                    item.setData(_SOURCE_TEXT_ROLE, "Project received")
+                if column == "Full Name":
+                    item.setForeground(self._candidate_name_color(value))
+                    item.setFont(
+                        QFont(
+                            item.font().family(),
+                            item.font().pointSize(),
+                            QFont.Weight.Bold,
+                        )
+                    )
+                self.interview_table.setItem(
+                    row_index,
+                    column_index + 1,
+                    item,
+                )
+        _apply_language_to_widgets(self, self.language)
 
     def _add_application(self):
         dialog = ApplicationDialog(parent=self)
@@ -1638,7 +2603,9 @@ class WeRhereMainWindow(QMainWindow):
                 self._show_error("Meeting title is required.")
                 return
             if not self._valid_meeting_time(payload["meeting_time"]):
-                self._show_error("Enter the date and time as YYYY-MM-DD HH:MM.")
+                self._show_error(
+                    "Enter a date as YYYY-MM-DD or a date and time as YYYY-MM-DD HH:MM."
+                )
                 return
             self.db.add_meeting(payload)
             self._refresh_meetings()
@@ -1661,7 +2628,9 @@ class WeRhereMainWindow(QMainWindow):
                 self._show_error("Meeting title is required.")
                 return
             if not self._valid_meeting_time(payload["meeting_time"]):
-                self._show_error("Enter the date and time as YYYY-MM-DD HH:MM.")
+                self._show_error(
+                    "Enter a date as YYYY-MM-DD or a date and time as YYYY-MM-DD HH:MM."
+                )
                 return
             self.db.update_meeting(meeting_id, payload)
             self._refresh_meetings()
@@ -1669,11 +2638,23 @@ class WeRhereMainWindow(QMainWindow):
 
     @staticmethod
     def _valid_meeting_time(value: str) -> bool:
-        try:
-            datetime.strptime(value, "%Y-%m-%d %H:%M")
-        except ValueError:
+        return WeRhereMainWindow._meeting_datetime(value) is not None
+
+    @staticmethod
+    def _meeting_datetime(value: str) -> datetime | None:
+        for format_string in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value, format_string)
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _is_upcoming_meeting(cls, meeting: dict) -> bool:
+        if meeting["status"].casefold() in {"completed", "cancelled"}:
             return False
-        return True
+        meeting_datetime = cls._meeting_datetime(meeting["meeting_time"])
+        return meeting_datetime is not None and meeting_datetime >= datetime.now()
 
     def _delete_meeting(self):
         selected = self.meeting_table.selectionModel().selectedRows()
@@ -1723,18 +2704,27 @@ class WeRhereMainWindow(QMainWindow):
         self._refresh_dashboard()
 
     def _show_error(self, text: str):
-        QMessageBox.warning(self, "WeRhere", text)
+        QMessageBox.warning(self, "WeRhere", translate(text, self.language))
 
 
 def main():
     import sys
 
     app = QApplication(sys.argv)
-    login = LoginDialog()
+    try:
+        login = LoginDialog()
+    except DriveImportError as error:
+        QMessageBox.critical(
+            None,
+            "WeRhere",
+            f"Could not load the shared CRM data. Check your internet connection "
+            f"and Drive access, then restart the app.\n\n{error}",
+        )
+        return
     if login.exec() != QDialog.DialogCode.Accepted:
         return
 
-    window = WeRhereMainWindow(login.authenticated_user)
+    window = WeRhereMainWindow(login.authenticated_user, login.language)
     window.show()
     sys.exit(app.exec())
 

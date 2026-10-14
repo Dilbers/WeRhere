@@ -1,26 +1,47 @@
 from __future__ import annotations
 
-import os
+import hashlib
+import hmac
+import json
+import secrets
 import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Mapping, Optional
+
+from .drive_import import DriveImportError, download_workbooks, read_workbooks
 
 DB_PATH = Path(__file__).resolve().parent.parent / "wehere.db"
+_PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
+_PASSWORD_HASH_ITERATIONS = 310_000
+_NOT_PROVIDED = "Not provided"
 
 
 class DatabaseManager:
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        import_drive_data: bool = True,
+    ):
         self.db_path = db_path or DB_PATH
         self._ensure_parent_dir()
         self._init_db()
+        if import_drive_data:
+            self._import_drive_data_once()
 
     def _ensure_parent_dir(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -30,7 +51,7 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT UNIQUE NOT NULL,
                     password TEXT NOT NULL,
-                    role TEXT NOT NULL DEFAULT 'resident',
+                    role TEXT NOT NULL DEFAULT 'user',
                     display_name TEXT NOT NULL DEFAULT '',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
@@ -41,7 +62,7 @@ class DatabaseManager:
             }
             if "role" not in user_columns:
                 conn.execute(
-                    "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'resident'"
+                    "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'"
                 )
             if "display_name" not in user_columns:
                 conn.execute(
@@ -58,10 +79,18 @@ class DatabaseManager:
                     priority TEXT NOT NULL,
                     last_update TEXT NOT NULL,
                     notes TEXT,
+                    current_status TEXT NOT NULL DEFAULT '',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            application_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(applications)")
+            }
+            if "current_status" not in application_columns:
+                conn.execute(
+                    "ALTER TABLE applications ADD COLUMN current_status TEXT NOT NULL DEFAULT ''"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS meetings (
@@ -112,112 +141,334 @@ class DatabaseManager:
                 )
                 """
             )
-
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO users (username, password, role, display_name)
-                VALUES (?, ?, ?, ?)
-                """,
-                ("admin", "admin123", "admin", "Administrator"),
-            )
-            conn.execute(
-                """
-                UPDATE users SET role = 'admin', display_name = 'Administrator'
-                WHERE username = 'admin'
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO users (username, password, role, display_name)
-                VALUES (?, ?, ?, ?)
-                """,
-                ("resident", "resident123", "resident", "Ava Martin"),
-            )
-
-            if conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0] == 0:
-                conn.executemany(
-                    """
-                    INSERT INTO applications (applicant_name, type_name, location, status, priority, last_update, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        ("Maya Chen", "Shared room", "Dockside", "Approved", "High", "Today, 10:40 AM", "Documents verified and assigned to the preferred accommodation."),
-                        ("Daniel Smith", "Private room", "Harbor View", "In review", "Medium", "Today, 09:10 AM", "Awaiting final confirmation from the housing coordinator."),
-                        ("Ava Martin", "Container unit", "North site", "Pending", "High", "Yesterday", "Needs a follow-up interview before approval."),
-                        ("Liam Scott", "Studio", "West block", "Approved", "Medium", "Mon", "Application cleared and move-in scheduled."),
-                        ("Sofia Kim", "Shared room", "South market", "Needs follow-up", "High", "Sun", "Additional ID verification requested."),
-                    ],
-                )
-
-            if conn.execute("SELECT COUNT(*) FROM meetings").fetchone()[0] == 0:
-                conn.executemany(
-                    "INSERT INTO meetings (title, meeting_time, status) VALUES (?, ?, ?)",
-                    [
-                        ("Interview", "2026-10-15 09:00", "Scheduled"),
-                        ("Review", "2026-10-15 11:30", "Pending"),
-                        ("Move-in check", "2026-10-15 14:00", "Approved"),
-                        ("Resident support", "2026-10-16 16:30", "Scheduled"),
-                    ],
-                )
             conn.execute(
                 """
                 UPDATE meetings SET mentor_name = 'Community team'
                 WHERE mentor_name = ''
                 """
             )
-
-            if conn.execute("SELECT COUNT(*) FROM residents").fetchone()[0] == 0:
-                conn.executemany(
-                    """
-                    INSERT INTO residents (name, role, description, initials, color)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    [
-                        ("Ahamed", "Shared accommodation", "Profile summary and onboarding context.", "AH", "#DCE7F5"),
-                        ("Sara", "Container accommodation", "Profile summary and onboarding context.", "SA", "#E5F0DF"),
-                        ("Ali", "Commercial accommodation", "Profile summary and onboarding context.", "AL", "#F0E1D8"),
-                    ],
-                )
             conn.execute(
                 """
-                INSERT INTO residents (name, role, description, initials, color)
-                SELECT ?, ?, ?, ?, ?
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM residents WHERE LOWER(TRIM(name)) = LOWER(?)
+                CREATE TABLE IF NOT EXISTS source_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workbook_name TEXT NOT NULL,
+                    sheet_name TEXT NOT NULL,
+                    source_row INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE (workbook_name, sheet_name, source_row)
                 )
-                """,
-                (
-                    "Ava Martin",
-                    "Resident",
-                    "Resident profile and onboarding context.",
-                    "AM",
-                    "#E5F0DF",
-                    "Ava Martin",
-                ),
+                """
             )
-            message_exists = conn.execute(
+            conn.execute(
                 """
-                SELECT 1 FROM messages
-                WHERE sender_username = 'admin'
-                  AND recipient_username = 'resident'
-                  AND subject = 'Your WeRhere support update'
-                LIMIT 1
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
                 """
+            )
+
+    def _import_drive_data_once(self) -> None:
+        with self._connect() as conn:
+            imported = conn.execute(
+                "SELECT 1 FROM app_meta WHERE key = 'drive_import_completed'"
             ).fetchone()
-            if message_exists is None:
+        if imported is not None:
+            return
+        self.import_workbooks(download_workbooks())
+
+    def import_workbooks(self, workbook_sources: Mapping[str, bytes]) -> bool:
+        parsed = read_workbooks(workbook_sources)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM app_meta WHERE key = 'drive_import_completed'"
+            ).fetchone():
+                return False
+            self._insert_imported_workbooks(conn, parsed)
+            conn.execute(
+                """
+                INSERT INTO app_meta (key, value)
+                VALUES ('drive_import_completed', ?)
+                """,
+                (datetime.now().astimezone().isoformat(timespec="seconds"),),
+            )
+        return True
+
+    def _insert_imported_workbooks(
+        self,
+        conn: sqlite3.Connection,
+        workbooks: Dict[str, List[Dict[str, Any]]],
+    ) -> None:
+        source_usernames: set[str] = set()
+        for workbook_name, sheets in workbooks.items():
+            for sheet in sheets:
+                headers = sheet["headers"]
+                password_indices = {
+                    index
+                    for index, header in enumerate(headers)
+                    if header.casefold() == "password"
+                }
+                for row_number, row in sheet["rows"]:
+                    values = list(row)
+                    for password_index in password_indices:
+                        if password_index < len(values):
+                            values[password_index] = "[REDACTED]"
+                    payload = json.dumps(
+                        {
+                            "headers": headers,
+                            "values": [self._json_value(value) for value in values],
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO source_records
+                            (workbook_name, sheet_name, source_row, payload_json)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (workbook_name, sheet["sheet_name"], row_number, payload),
+                    )
+
+                    if workbook_name == "Applications":
+                        self._import_application_row(conn, headers, row)
+                    elif workbook_name == "Mentor":
+                        if sheet["sheet_name"] == "Mentor":
+                            self._import_mentor_row(conn, headers, row)
+                    elif workbook_name == "Users" and sheet["sheet_name"] == "Users":
+                        username = self._source_text(headers, row, "Username")
+                        password = self._source_text(headers, row, "Password")
+                        source_role = self._source_text(headers, row, "Role").casefold()
+                        roles = {"admin": "admin", "user": "user"}
+                        if not username or not password.strip() or source_role not in roles:
+                            raise DriveImportError(
+                                "Users.xlsx contains a row with a missing username, password, or supported role."
+                            )
+                        if username in source_usernames:
+                            raise DriveImportError(
+                                "Users.xlsx contains duplicate usernames."
+                            )
+                        source_usernames.add(username)
+                        conn.execute(
+                            """
+                            INSERT INTO users (username, password, role, display_name)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT(username) DO UPDATE SET
+                                password = excluded.password,
+                                role = excluded.role,
+                                display_name = excluded.display_name
+                            """,
+                            (
+                                username,
+                                self._hash_password(password),
+                                roles[source_role],
+                                username,
+                            ),
+                        )
+        self._remove_demo_records(conn, source_usernames)
+
+    def _import_application_row(
+        self,
+        conn: sqlite3.Connection,
+        headers: List[str],
+        row: List[Any],
+    ) -> None:
+        name = self._source_text(headers, row, "Full Name")
+        if not name:
+            return
+        current_status = self._source_text(headers, row, "Current Status")
+        conn.execute(
+            """
+            INSERT INTO applications
+                (applicant_name, type_name, location, status, priority, last_update, notes, current_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                self._source_text(headers, row, "Desired Training") or _NOT_PROVIDED,
+                self._source_text(headers, row, "Province") or _NOT_PROVIDED,
+                self._source_text(headers, row, "Processing Status") or _NOT_PROVIDED,
+                "Not specified",
+                self._source_text(headers, row, "Timestamp") or _NOT_PROVIDED,
+                "",
+                current_status,
+            ),
+        )
+    def _import_mentor_row(
+        self,
+        conn: sqlite3.Connection,
+        headers: List[str],
+        row: List[Any],
+    ) -> None:
+        candidate = self._source_text(headers, row, "Candidate Name")
+        mentor = self._source_text(headers, row, "Mentor Name")
+        session_date = self._source_date(headers, row, "Date")
+        if not candidate or not mentor or not session_date:
+            return
+        conn.execute(
+            """
+            INSERT INTO meetings
+                (title, meeting_time, status, mentor_name, resident_name)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("Mentor review", session_date, "Completed", mentor, candidate),
+        )
+
+    @staticmethod
+    def _source_text(headers: List[str], row: List[Any], column: str) -> str:
+        column_index = next(
+            index
+            for index, header in enumerate(headers)
+            if header.casefold() == column.casefold()
+        )
+        if column_index >= len(row) or row[column_index] is None:
+            return ""
+        value = row[column_index]
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        return str(value).strip()
+
+    @classmethod
+    def _source_date(cls, headers: List[str], row: List[Any], column: str) -> str:
+        value = cls._source_text(headers, row, column)
+        if not value:
+            return ""
+        try:
+            return date.fromisoformat(value[:10]).isoformat()
+        except ValueError as error:
+            raise DriveImportError(
+                "Mentor.xlsx contains an invalid session date."
+            ) from error
+
+    @staticmethod
+    def _json_value(value: Any) -> Any:
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        isoformat = getattr(value, "isoformat", None)
+        if callable(isoformat):
+            return isoformat()
+        return str(value)
+
+    @staticmethod
+    def _hash_password(password: str) -> str:
+        salt = secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            _PASSWORD_HASH_ITERATIONS,
+        )
+        return "$".join(
+            (
+                _PASSWORD_HASH_PREFIX,
+                str(_PASSWORD_HASH_ITERATIONS),
+                salt.hex(),
+                digest.hex(),
+            )
+        )
+
+    @staticmethod
+    def _verify_password(password: str, stored_password: str) -> bool:
+        if not stored_password.startswith(f"{_PASSWORD_HASH_PREFIX}$"):
+            return hmac.compare_digest(stored_password, password)
+        try:
+            prefix, iteration_text, salt_hex, digest_hex = stored_password.split("$")
+            iterations = int(iteration_text)
+            expected_digest = bytes.fromhex(digest_hex)
+            salt = bytes.fromhex(salt_hex)
+        except ValueError:
+            return False
+        if prefix != _PASSWORD_HASH_PREFIX or iterations < 1:
+            return False
+        actual_digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iterations
+        )
+        return hmac.compare_digest(actual_digest, expected_digest)
+
+    @staticmethod
+    def _remove_demo_records(
+        conn: sqlite3.Connection, imported_usernames: set[str]
+    ) -> None:
+        demo_applications = (
+            ("Maya Chen", "Shared room", "Dockside", "Approved", "High", "Today, 10:40 AM", "Documents verified and assigned to the preferred accommodation."),
+            ("Daniel Smith", "Private room", "Harbor View", "In review", "Medium", "Today, 09:10 AM", "Awaiting final confirmation from the housing coordinator."),
+            ("Ava Martin", "Container unit", "North site", "Pending", "High", "Yesterday", "Needs a follow-up interview before approval."),
+            ("Liam Scott", "Studio", "West block", "Approved", "Medium", "Mon", "Application cleared and move-in scheduled."),
+            ("Sofia Kim", "Shared room", "South market", "Needs follow-up", "High", "Sun", "Additional ID verification requested."),
+        )
+        for application in demo_applications:
+            conn.execute(
+                """
+                DELETE FROM applications
+                WHERE applicant_name = ? AND type_name = ? AND location = ?
+                  AND status = ? AND priority = ? AND last_update = ? AND notes = ?
+                """,
+                application,
+            )
+
+        demo_meetings = (
+            ("Interview", "2026-10-15 09:00", "Scheduled"),
+            ("Review", "2026-10-15 11:30", "Pending"),
+            ("Move-in check", "2026-10-15 14:00", "Approved"),
+            ("Resident support", "2026-10-16 16:30", "Scheduled"),
+        )
+        for meeting in demo_meetings:
+            conn.execute(
+                """
+                DELETE FROM meetings
+                WHERE title = ? AND meeting_time = ? AND status = ?
+                  AND mentor_name = 'Community team' AND resident_name = ''
+                """,
+                meeting,
+            )
+
+        demo_residents = (
+            ("Ahamed", "Shared accommodation", "Profile summary and onboarding context.", "AH", "#DCE7F5"),
+            ("Sara", "Container accommodation", "Profile summary and onboarding context.", "SA", "#E5F0DF"),
+            ("Ali", "Commercial accommodation", "Profile summary and onboarding context.", "AL", "#F0E1D8"),
+            ("Ava Martin", "Resident", "Resident profile and onboarding context.", "AM", "#E5F0DF"),
+        )
+        for resident in demo_residents:
+            conn.execute(
+                """
+                DELETE FROM residents
+                WHERE name = ? AND role = ? AND description = ?
+                  AND initials = ? AND color = ?
+                """,
+                resident,
+            )
+
+        conn.execute(
+            """
+            DELETE FROM messages
+            WHERE sender_username = 'admin' AND recipient_username = 'resident'
+              AND subject = 'Your WeRhere support update'
+              AND body = ?
+            """,
+            (
+                "Welcome. Your application updates, scheduled meetings and support "
+                "information are available from your account. Please reply here "
+                "if you need help with your next step.",
+            ),
+        )
+        demo_users = (
+            ("admin", "admin123", "Administrator"),
+            ("resident", "resident123", "Ava Martin"),
+        )
+        imported_usernames_normalized = {
+            username.casefold() for username in imported_usernames
+        }
+        for username, password, display_name in demo_users:
+            if username.casefold() not in imported_usernames_normalized:
                 conn.execute(
                     """
-                    INSERT INTO messages (sender_username, recipient_username, subject, body)
-                    VALUES (?, ?, ?, ?)
+                    DELETE FROM users
+                    WHERE username = ? AND password = ? AND display_name = ?
                     """,
-                    (
-                        "admin",
-                        "resident",
-                        "Your WeRhere support update",
-                        "Welcome. Your application updates, scheduled meetings and support "
-                        "information are available from your account. Please reply here "
-                        "if you need help with your next step.",
-                    ),
+                    (username, password, display_name),
                 )
 
     def authenticate_user(self, username: str, password: str) -> bool:
@@ -229,12 +480,21 @@ class DatabaseManager:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT username, role, display_name
-                FROM users WHERE username = ? AND password = ?
+                SELECT username, password, role, display_name
+                FROM users WHERE username = ?
                 """,
-                (username.strip(), password),
+                (username.strip(),),
             ).fetchone()
-            return dict(row) if row is not None else None
+            if row is None or not self._verify_password(password, row["password"]):
+                return None
+            if not row["password"].startswith(f"{_PASSWORD_HASH_PREFIX}$"):
+                conn.execute(
+                    "UPDATE users SET password = ? WHERE username = ?",
+                    (self._hash_password(password), row["username"]),
+                )
+            result = dict(row)
+            del result["password"]
+            return result
 
     def list_applications(self, query: str = "") -> List[Dict[str, Any]]:
         with self._connect() as conn:
@@ -390,6 +650,78 @@ class DatabaseManager:
                     "SELECT username, role, display_name FROM users ORDER BY display_name, username"
                 ).fetchall()
             return [dict(row) for row in rows]
+
+    def list_source_records(
+        self, workbook_name: str, sheet_name: str
+    ) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_row, payload_json
+                FROM source_records
+                WHERE workbook_name = ? AND sheet_name = ?
+                ORDER BY source_row
+                """,
+                (workbook_name, sheet_name),
+            ).fetchall()
+            return [
+                {"source_row": row["source_row"], **json.loads(row["payload_json"])}
+                for row in rows
+            ]
+
+    def save_application_source_record(
+        self, values: Mapping[str, Any], source_row: Optional[int] = None
+    ) -> int:
+        with self._connect() as conn:
+            template = conn.execute(
+                """
+                SELECT payload_json FROM source_records
+                WHERE workbook_name = 'Applications' AND sheet_name = 'Applications'
+                ORDER BY source_row LIMIT 1
+                """
+            ).fetchone()
+            if template is None:
+                raise ValueError("Application workbook source fields are unavailable.")
+            headers = json.loads(template["payload_json"])["headers"]
+            payload = json.dumps(
+                {
+                    "headers": headers,
+                    "values": [
+                        self._json_value(values.get(header)) for header in headers
+                    ],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if source_row is None:
+                next_source_row = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(source_row), 1) + 1
+                    FROM source_records
+                    WHERE workbook_name = 'Applications' AND sheet_name = 'Applications'
+                    """
+                ).fetchone()[0]
+                conn.execute(
+                    """
+                    INSERT INTO source_records
+                        (workbook_name, sheet_name, source_row, payload_json)
+                    VALUES ('Applications', 'Applications', ?, ?)
+                    """,
+                    (next_source_row, payload),
+                )
+                return int(next_source_row)
+
+            cursor = conn.execute(
+                """
+                UPDATE source_records SET payload_json = ?
+                WHERE workbook_name = 'Applications' AND sheet_name = 'Applications'
+                  AND source_row = ?
+                """,
+                (payload, source_row),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("The selected application record no longer exists.")
+            return source_row
 
     def list_messages(self, username: str) -> List[Dict[str, Any]]:
         with self._connect() as conn:

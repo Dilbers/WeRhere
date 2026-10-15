@@ -1,6 +1,6 @@
 # WeRhere PyQt6 Desktop App
 
-This project is a desktop CRM prototype for managing VIT IT-training applicants. It is built in PyQt6 and stores a local snapshot of the shared Google Drive workbooks in SQLite.
+This project is a desktop CRM for managing VIT IT-training applicants. It is built in PyQt6, reads its source workbooks from Google Sheets, and keeps a local SQLite cache.
 
 ## Quick start
 
@@ -24,10 +24,27 @@ Then launch the app:
 .\.venv\Scripts\python.exe -m app.main
 ```
 
-On first launch, the app needs an internet connection and read access to the
-shared Google Drive workbooks. It imports `Applications.xlsx`, `Interviews.xlsx`,
-`Mentor.xlsx`, and `Users.xlsx` into `wehere.db` once. Later launches use that
-local database and do not download or synchronize workbook changes.
+## Google Sheets setup
+
+The app connects to four Google Sheets copies configured in
+`app/drive_import.py`. Keep the required worksheet names and column headers
+unchanged. The Google account used to authorize the app must have access to all
+four copies.
+
+1. In Google Cloud Console, create a project and enable the Google Sheets API.
+2. Configure an OAuth consent screen and create an OAuth client with application
+   type **Desktop app**.
+3. Download its JSON file and save it as
+   `credentials/google_oauth_client.json` in this project.
+4. Install requirements and launch the app. On first launch, a browser opens so
+   you can authorize access to your Sheets. The local OAuth token is saved under
+   `credentials/` and is excluded from Git.
+
+At startup, the app reads the four Sheets into its local SQLite cache. Adding
+or editing an applicant writes the change to the online Applications sheet and
+then updates the local cache. Other workspace data, such as messages and
+scheduled appointments, remains local. Google Calendar event capture and email
+sending are not configured.
 
 The workspace has Applications, Mentor interviews, Mentors, and Interviews screens.
 Applications can be searched and filtered by mentor assignment, duplicate
@@ -53,11 +70,11 @@ The source `Password` cells are excluded from the local source-record archive;
 imported account passwords are stored as salted PBKDF2 hashes. Workbook users
 with the `user` role keep that role in the application.
 
-Each computer has its own local database. The workbooks include personal
-information, so keep `wehere.db` private and do not share or commit it. If the
-shared workbooks cannot be downloaded or validated, startup displays an error
-instead of silently substituting sample data. Ask the coordinator for workbook
-access or account credentials.
+Each computer has its own local database and Google OAuth token. The workbooks
+include personal information, so keep `wehere.db` and the `credentials/`
+directory private and do not share or commit them. If the Sheets cannot be read
+or validated, startup displays an error instead of silently substituting sample
+data.
 
 The app opens on a welcome screen. Select **Sign in to your account** to reach
 the username and password form. Password visibility can be toggled; password
@@ -92,7 +109,7 @@ creation are not available in this local build.
 ## Structure
 
 - `app/backend.py` — SQLite-backed data layer, role-aware authentication, and preserved workbook source rows
-- `app/drive_import.py` — one-time download and validation of the shared Google Drive workbooks
+- `app/drive_import.py` — authenticated Google Sheets read/write and workbook validation
 - `app/real_ui.py` — branded login flow and the full polished desktop interface
 - `app/localization.py` — English, Turkish, and Dutch interface text
 - `app/styles.qss` — light theme and shared component styling
@@ -101,5 +118,6 @@ creation are not available in this local build.
 
 ## Notes
 
-The application stores data locally in `wehere.db`. It does not connect to an
-external email provider, Google Calendar, or a hosted multi-user service.
+The application caches source records locally in `wehere.db`; source workbook
+changes and applicant additions/edits synchronize with the configured Google
+Sheets. Messages and scheduled appointments remain local to each computer.

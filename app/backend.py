@@ -10,7 +10,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Mapping, Optional
 
-from .drive_import import DriveImportError, download_workbooks, read_workbooks
+from .drive_import import DriveImportError, GoogleSheetsStore, read_workbooks
 
 DB_PATH = Path(__file__).resolve().parent.parent / "wehere.db"
 _PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
@@ -25,10 +25,11 @@ class DatabaseManager:
         import_drive_data: bool = True,
     ):
         self.db_path = db_path or DB_PATH
+        self.drive = GoogleSheetsStore()
         self._ensure_parent_dir()
         self._init_db()
         if import_drive_data:
-            self._import_drive_data_once()
+            self._sync_drive_data()
 
     def _ensure_parent_dir(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +81,7 @@ class DatabaseManager:
                     last_update TEXT NOT NULL,
                     notes TEXT,
                     current_status TEXT NOT NULL DEFAULT '',
+                    source_row INTEGER,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -91,6 +93,14 @@ class DatabaseManager:
                 conn.execute(
                     "ALTER TABLE applications ADD COLUMN current_status TEXT NOT NULL DEFAULT ''"
                 )
+            if "source_row" not in application_columns:
+                conn.execute("ALTER TABLE applications ADD COLUMN source_row INTEGER")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_source_row
+                ON applications(source_row) WHERE source_row IS NOT NULL
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS meetings (
@@ -114,6 +124,10 @@ class DatabaseManager:
             if "resident_name" not in meeting_columns:
                 conn.execute(
                     "ALTER TABLE meetings ADD COLUMN resident_name TEXT NOT NULL DEFAULT ''"
+                )
+            if "mentor_source_row" not in meeting_columns:
+                conn.execute(
+                    "ALTER TABLE meetings ADD COLUMN mentor_source_row INTEGER"
                 )
             conn.execute(
                 """
@@ -168,14 +182,206 @@ class DatabaseManager:
                 """
             )
 
-    def _import_drive_data_once(self) -> None:
+    def _sync_drive_data(self) -> None:
         with self._connect() as conn:
             imported = conn.execute(
                 "SELECT 1 FROM app_meta WHERE key = 'drive_import_completed'"
             ).fetchone()
-        if imported is not None:
-            return
-        self.import_workbooks(download_workbooks())
+        workbook_sources = self.drive.download_workbooks()
+        if imported is None:
+            self.import_workbooks(workbook_sources)
+        else:
+            self._refresh_source_records(workbook_sources)
+
+    def _refresh_source_records(self, workbook_sources: Mapping[str, bytes]) -> None:
+        parsed = read_workbooks(workbook_sources)
+        imported_usernames: set[str] = set()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._mark_existing_imported_applications(conn)
+            conn.execute("DELETE FROM source_records")
+            conn.execute("DELETE FROM applications WHERE source_row IS NOT NULL")
+            conn.execute("DELETE FROM meetings WHERE title = 'Mentor review'")
+            for workbook_name, sheets in parsed.items():
+                for sheet in sheets:
+                    headers = sheet["headers"]
+                    password_indices = {
+                        index
+                        for index, header in enumerate(headers)
+                        if header.casefold() == "password"
+                    }
+                    for row_number, row in sheet["rows"]:
+                        values = list(row)
+                        source_values = list(values)
+                        for password_index in password_indices:
+                            if password_index < len(source_values):
+                                source_values[password_index] = "[REDACTED]"
+                        payload = json.dumps(
+                            {
+                                "headers": headers,
+                                "values": [
+                                    self._json_value(value) for value in source_values
+                                ],
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO source_records
+                                (workbook_name, sheet_name, source_row, payload_json)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (workbook_name, sheet["sheet_name"], row_number, payload),
+                        )
+                        if workbook_name == "Applications":
+                            self._import_application_row(
+                                conn, headers, values, source_row=row_number
+                            )
+                        elif workbook_name == "Mentor" and sheet["sheet_name"] == "Mentor":
+                            self._import_mentor_row(conn, headers, values)
+                        if workbook_name == "Users" and sheet["sheet_name"] == "Users":
+                            username = self._source_text(headers, values, "Username")
+                            password = self._source_text(headers, values, "Password")
+                            source_role = self._source_text(
+                                headers, values, "Role"
+                            ).casefold()
+                            roles = {"admin": "admin", "user": "user"}
+                            if (
+                                not username
+                                or not password.strip()
+                                or source_role not in roles
+                            ):
+                                raise DriveImportError(
+                                    "Users.xlsx contains a row with a missing username, "
+                                    "password, or supported role."
+                                )
+                            if username in imported_usernames:
+                                raise DriveImportError(
+                                    "Users.xlsx contains duplicate usernames."
+                                )
+                            imported_usernames.add(username)
+                            conn.execute(
+                                """
+                                INSERT INTO users (username, password, role, display_name)
+                                VALUES (?, ?, ?, ?)
+                                ON CONFLICT(username) DO UPDATE SET
+                                    password = excluded.password,
+                                    role = excluded.role,
+                                    display_name = excluded.display_name
+                                """,
+                                (
+                                    username,
+                                    self._hash_password(password),
+                                    roles[source_role],
+                                    username,
+                                ),
+                            )
+            if not imported_usernames:
+                raise DriveImportError("Users.xlsx contains no user accounts.")
+            placeholders = ", ".join("?" for _ in imported_usernames)
+            conn.execute(
+                f"DELETE FROM users WHERE username NOT IN ({placeholders})",
+                tuple(imported_usernames),
+            )
+
+    def _mark_existing_imported_applications(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT source_row, payload_json FROM source_records
+            WHERE workbook_name = 'Applications' AND sheet_name = 'Applications'
+            ORDER BY source_row
+            """
+        ).fetchall()
+        for source in rows:
+            payload = json.loads(source["payload_json"])
+            fields = dict(zip(payload["headers"], payload["values"]))
+            imported = (
+                str(fields.get("Full Name") or "").strip(),
+                str(fields.get("Desired Training") or _NOT_PROVIDED).strip(),
+                str(fields.get("Province") or _NOT_PROVIDED).strip(),
+            )
+            conn.execute(
+                """
+                UPDATE applications SET source_row = ?
+                WHERE id = (
+                    SELECT id FROM applications
+                    WHERE source_row IS NULL AND applicant_name = ? AND type_name = ?
+                      AND location = ?
+                    ORDER BY id LIMIT 1
+                )
+                """,
+                (source["source_row"], *imported),
+            )
+
+    def save_application_source_record_to_drive(
+        self, values: Mapping[str, Any], source_row: Optional[int] = None
+    ) -> int:
+        with self._connect() as conn:
+            template = conn.execute(
+                """
+                SELECT payload_json FROM source_records
+                WHERE workbook_name = 'Applications' AND sheet_name = 'Applications'
+                ORDER BY source_row LIMIT 1
+                """
+            ).fetchone()
+        if template is None:
+            raise ValueError("Application workbook source fields are unavailable.")
+        headers = json.loads(template["payload_json"])["headers"]
+        if source_row is None:
+            source_row = self.drive.append_application(headers, values)
+        else:
+            self.drive.update_application(headers, values, source_row)
+        self.save_application_source_record(values, source_row=source_row)
+        with self._connect() as conn:
+            self._import_application_row(
+                conn,
+                headers,
+                [values.get(header) for header in headers],
+                source_row=source_row,
+            )
+        return source_row
+
+    def save_mentor_interview_to_drive(
+        self, meeting_id: int, values: Mapping[str, Any]
+    ) -> int:
+        headers = [
+            "Date",
+            "VIT Group",
+            "Candidate Name",
+            "Mentor Name",
+            "Score",
+            "Recommendation",
+            "Alternative Recommendation",
+            "Secondary Score",
+            "Notes",
+        ]
+        source_row = self.drive.append_mentor_record(headers, values)
+        payload = json.dumps(
+            {"headers": headers, "values": [self._json_value(values.get(h, "")) for h in headers]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_records
+                    (workbook_name, sheet_name, source_row, payload_json)
+                VALUES ('Mentor', 'Mentor', ?, ?)
+                ON CONFLICT(workbook_name, sheet_name, source_row)
+                DO UPDATE SET payload_json = excluded.payload_json
+                """,
+                (source_row, payload),
+            )
+            conn.execute(
+                """
+                UPDATE meetings
+                SET status = 'Completed', mentor_source_row = ?
+                WHERE id = ?
+                """,
+                (source_row, meeting_id),
+            )
+        return source_row
 
     def import_workbooks(self, workbook_sources: Mapping[str, bytes]) -> bool:
         parsed = read_workbooks(workbook_sources)
@@ -232,7 +438,9 @@ class DatabaseManager:
                     )
 
                     if workbook_name == "Applications":
-                        self._import_application_row(conn, headers, row)
+                        self._import_application_row(
+                            conn, headers, row, source_row=row_number
+                        )
                     elif workbook_name == "Mentor":
                         if sheet["sheet_name"] == "Mentor":
                             self._import_mentor_row(conn, headers, row)
@@ -273,27 +481,44 @@ class DatabaseManager:
         conn: sqlite3.Connection,
         headers: List[str],
         row: List[Any],
+        source_row: Optional[int] = None,
     ) -> None:
         name = self._source_text(headers, row, "Full Name")
         if not name:
             return
         current_status = self._source_text(headers, row, "Current Status")
+        values = (
+            name,
+            self._source_text(headers, row, "Desired Training") or _NOT_PROVIDED,
+            self._source_text(headers, row, "Province") or _NOT_PROVIDED,
+            self._source_text(headers, row, "Processing Status") or _NOT_PROVIDED,
+            "Not specified",
+            self._source_text(headers, row, "Timestamp") or _NOT_PROVIDED,
+            "",
+            current_status,
+        )
+        if source_row is not None:
+            existing = conn.execute(
+                "SELECT id FROM applications WHERE source_row = ?", (source_row,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE applications SET applicant_name = ?, type_name = ?, location = ?,
+                        status = ?, priority = ?, last_update = ?, notes = ?, current_status = ?
+                    WHERE source_row = ?
+                    """,
+                    (*values, source_row),
+                )
+                return
         conn.execute(
             """
             INSERT INTO applications
-                (applicant_name, type_name, location, status, priority, last_update, notes, current_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (applicant_name, type_name, location, status, priority, last_update,
+                 notes, current_status, source_row)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                name,
-                self._source_text(headers, row, "Desired Training") or _NOT_PROVIDED,
-                self._source_text(headers, row, "Province") or _NOT_PROVIDED,
-                self._source_text(headers, row, "Processing Status") or _NOT_PROVIDED,
-                "Not specified",
-                self._source_text(headers, row, "Timestamp") or _NOT_PROVIDED,
-                "",
-                current_status,
-            ),
+            (*values, source_row),
         )
     def _import_mentor_row(
         self,
@@ -711,16 +936,16 @@ class DatabaseManager:
                 )
                 return int(next_source_row)
 
-            cursor = conn.execute(
+            conn.execute(
                 """
-                UPDATE source_records SET payload_json = ?
-                WHERE workbook_name = 'Applications' AND sheet_name = 'Applications'
-                  AND source_row = ?
+                INSERT INTO source_records
+                    (workbook_name, sheet_name, source_row, payload_json)
+                VALUES ('Applications', 'Applications', ?, ?)
+                ON CONFLICT(workbook_name, sheet_name, source_row)
+                DO UPDATE SET payload_json = excluded.payload_json
                 """,
-                (payload, source_row),
+                (source_row, payload),
             )
-            if cursor.rowcount != 1:
-                raise ValueError("The selected application record no longer exists.")
             return source_row
 
     def list_messages(self, username: str) -> List[Dict[str, Any]]:

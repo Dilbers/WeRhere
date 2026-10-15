@@ -190,6 +190,15 @@ QMainWindow, QDialog {
     font-size: 13px;
 }
 
+#statusLegendTitle, #statusLegendLabel {
+    color: #627187;
+    font-size: 11px;
+}
+
+#statusLegendTitle {
+    font-weight: 700;
+}
+
 #panelTitle {
     color: #25364a;
     font-size: 17px;
@@ -260,6 +269,14 @@ QLineEdit, QComboBox, QTextEdit {
     color: #26364a;
     padding: 6px 12px;
     selection-background-color: #f2b9ae;
+}
+
+#applicantFormScroll, #applicantForm {
+    background: #f4f7fb;
+}
+
+#applicantFormScroll {
+    border: none;
 }
 
 QLineEdit:focus, QComboBox:focus, QTextEdit:focus {
@@ -437,6 +454,24 @@ QScrollBar::handle:vertical {
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+    border: none;
+}
+
+QScrollBar:horizontal {
+    background: #f4f7fb;
+    height: 10px;
+    margin: 3px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #cbd5e1;
+    border-radius: 5px;
+    min-width: 24px;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: transparent;
     border: none;
 }

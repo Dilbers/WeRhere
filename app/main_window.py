@@ -136,7 +136,7 @@ class WeRhereMainWindow(QMainWindow):
 
     @staticmethod
     def _load_brand_logo() -> QPixmap | None:
-        logo_path = Path(__file__).resolve().parent / "assets" / "brand-logo.svg"
+        logo_path = Path(__file__).resolve().parent / "assets" / "brand-logo2.png"
         if not logo_path.exists():
             return None
         pixmap = QPixmap(str(logo_path))

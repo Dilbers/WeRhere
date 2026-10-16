@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from urllib.parse import quote
 
-from PyQt6.QtCore import QSettings, Qt, QUrl
+from PyQt6.QtCore import QSettings, QTimer, Qt, QUrl
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -1022,7 +1022,7 @@ class AvatarCard(QFrame):
 
 
 class WeRhereMainWindow(QMainWindow):
-    def __init__(self, user, language: str = "en"):
+    def __init__(self, user, language: str = "en", database=None):
         super().__init__()
         _register_windows_font()
         self.language = language if language in {code for _name, code in LANGUAGES} else "en"
@@ -1034,7 +1034,7 @@ class WeRhereMainWindow(QMainWindow):
         self.display_name = user["display_name"] or self.username
         self.role = user["role"]
         self.is_admin = self.role == "admin"
-        self.db = initialize_database()
+        self.db = database or initialize_database()
         self.setWindowTitle(
             translate("WeRhere | VIT applicant CRM", self.language)
         )
@@ -1682,7 +1682,12 @@ class WeRhereMainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.application_search = QLineEdit()
         self.application_search.setPlaceholderText("Search applicants by name or keyword")
-        self.application_search.textChanged.connect(self._refresh_applications)
+        self.application_search_timer = QTimer(self)
+        self.application_search_timer.setSingleShot(True)
+        self.application_search_timer.timeout.connect(self._refresh_applications)
+        self.application_search.textChanged.connect(
+            lambda _text: self.application_search_timer.start(180)
+        )
         toolbar.addWidget(self.application_search)
         search_btn = QPushButton("Search")
         search_btn.clicked.connect(self._refresh_applications)
@@ -1785,7 +1790,12 @@ class WeRhereMainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.meeting_search = QLineEdit()
         self.meeting_search.setPlaceholderText("Search candidates, mentors, or notes")
-        self.meeting_search.textChanged.connect(self._refresh_meetings)
+        self.meeting_search_timer = QTimer(self)
+        self.meeting_search_timer.setSingleShot(True)
+        self.meeting_search_timer.timeout.connect(self._refresh_meetings)
+        self.meeting_search.textChanged.connect(
+            lambda _text: self.meeting_search_timer.start(180)
+        )
         toolbar.addWidget(self.meeting_search)
         self.mentor_recommendation_filter = QComboBox()
         self.mentor_recommendation_filter.addItem("All conversations", "")
@@ -1870,7 +1880,12 @@ class WeRhereMainWindow(QMainWindow):
 
         self.mentor_search = QLineEdit()
         self.mentor_search.setPlaceholderText("Search mentors")
-        self.mentor_search.textChanged.connect(self._refresh_mentors)
+        self.mentor_search_timer = QTimer(self)
+        self.mentor_search_timer.setSingleShot(True)
+        self.mentor_search_timer.timeout.connect(self._refresh_mentors)
+        self.mentor_search.textChanged.connect(
+            lambda _text: self.mentor_search_timer.start(180)
+        )
         layout.addWidget(self.mentor_search)
 
         self.mentor_directory_count = QLabel("")
@@ -1915,7 +1930,12 @@ class WeRhereMainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.interview_search = QLineEdit()
         self.interview_search.setPlaceholderText("Search candidates")
-        self.interview_search.textChanged.connect(self._refresh_interviews)
+        self.interview_search_timer = QTimer(self)
+        self.interview_search_timer.setSingleShot(True)
+        self.interview_search_timer.timeout.connect(self._refresh_interviews)
+        self.interview_search.textChanged.connect(
+            lambda _text: self.interview_search_timer.start(180)
+        )
         toolbar.addWidget(self.interview_search)
         self.interview_filter_value = "all"
         self.interview_filter_buttons = {}
@@ -2288,6 +2308,7 @@ class WeRhereMainWindow(QMainWindow):
             return
 
     def _refresh_applications(self, _value=None):
+        self.application_search_timer.stop()
         raw_records = self.db.list_source_records("Applications", "Applications")
         all_records = [
             {
@@ -2547,6 +2568,7 @@ class WeRhereMainWindow(QMainWindow):
         )
 
     def _refresh_mentors(self, _value=None):
+        self.mentor_search_timer.stop()
         mentors = self._mentor_summaries()
         total = len(mentors)
         query = self.mentor_search.text().strip().casefold()
@@ -2645,6 +2667,7 @@ class WeRhereMainWindow(QMainWindow):
         return QColor(self.application_status_colors.get(name.strip().casefold(), "#687588"))
 
     def _refresh_meetings(self, _value=None):
+        self.meeting_search_timer.stop()
         raw_records = self.db.list_source_records("Mentor", "Mentor")
         records = [
             {
@@ -2839,6 +2862,7 @@ class WeRhereMainWindow(QMainWindow):
         return True
 
     def _refresh_interviews(self, _value=None):
+        self.interview_search_timer.stop()
         raw_records = self.db.list_source_records("Interviews", "Interviews")
         records = [self._source_record_values(record) for record in raw_records]
         query = self.interview_search.text().strip().casefold()
@@ -3059,7 +3083,9 @@ def main():
     if login.exec() != QDialog.DialogCode.Accepted:
         return
 
-    window = WeRhereMainWindow(login.authenticated_user, login.language)
+    window = WeRhereMainWindow(
+        login.authenticated_user, login.language, database=login.db
+    )
     window.show()
     sys.exit(app.exec())
 

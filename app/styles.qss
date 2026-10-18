@@ -190,6 +190,11 @@ QMainWindow, QDialog {
     font-size: 13px;
 }
 
+#syncStatus {
+    color: #77869a;
+    font-size: 11px;
+}
+
 #statusLegendTitle, #statusLegendLabel {
     color: #627187;
     font-size: 11px;

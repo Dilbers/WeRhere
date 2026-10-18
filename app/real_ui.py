@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from urllib.parse import quote
 
-from PyQt6.QtCore import QSettings, QTimer, Qt, QUrl
+from PyQt6.QtCore import QSettings, QThread, QTimer, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -39,6 +39,23 @@ from .localization import LANGUAGES, translate
 _UI_FONT_FAMILY: str | None = None
 _CURRENT_LANGUAGE = "en"
 _SOURCE_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 20
+
+
+class DriveRefreshWorker(QThread):
+    completed = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, database, parent=None):
+        super().__init__(parent)
+        self.database = database
+
+    def run(self):
+        try:
+            self.database.refresh_drive_data()
+        except Exception as error:
+            self.failed.emit(str(error))
+        else:
+            self.completed.emit()
 
 
 def _localized_stylesheet() -> str:
@@ -1677,6 +1694,29 @@ class WeRhereMainWindow(QMainWindow):
         title_group.addWidget(subtitle)
         header_row.addLayout(title_group)
         header_row.addStretch()
+        refresh_group = QVBoxLayout()
+        refresh_group.setSpacing(4)
+        self.drive_refresh_button = QPushButton("↻  Refresh from Drive")
+        self.drive_refresh_button.setObjectName("secondaryButton")
+        self.drive_refresh_button.setMinimumWidth(184)
+        self.drive_refresh_button.clicked.connect(self._start_drive_refresh)
+        refresh_group.addWidget(
+            self.drive_refresh_button, alignment=Qt.AlignmentFlag.AlignRight
+        )
+        self.drive_refresh_status = QLabel("Drive data loaded")
+        self.drive_refresh_status.setObjectName("syncStatus")
+        self.drive_refresh_status.setAlignment(Qt.AlignmentFlag.AlignRight)
+        last_sync = self.db.get_last_drive_sync()
+        if last_sync:
+            try:
+                last_sync_time = datetime.fromisoformat(last_sync).astimezone()
+                self.drive_refresh_status.setText(
+                    f"Last synced {last_sync_time.strftime('%d %b %Y, %H:%M')}"
+                )
+            except ValueError:
+                pass
+        refresh_group.addWidget(self.drive_refresh_status)
+        header_row.addLayout(refresh_group)
         layout.addLayout(header_row)
 
         toolbar = QHBoxLayout()
@@ -1772,6 +1812,56 @@ class WeRhereMainWindow(QMainWindow):
         layout.addWidget(self.application_details)
         self._refresh_applications()
         return page
+
+    def _start_drive_refresh(self):
+        worker = getattr(self, "drive_refresh_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        self.drive_refresh_button.setEnabled(False)
+        self.drive_refresh_button.setText("Refreshing…")
+        self.drive_refresh_status.setText("Checking Google Sheets for updates…")
+        worker = DriveRefreshWorker(self.db, self)
+        worker.completed.connect(self._on_drive_refresh_completed)
+        worker.failed.connect(self._on_drive_refresh_failed)
+        worker.finished.connect(self._on_drive_refresh_finished)
+        self.drive_refresh_worker = worker
+        worker.start()
+
+    def _on_drive_refresh_completed(self):
+        self._refresh_applications()
+        self._refresh_meetings()
+        self._refresh_mentors()
+        self._refresh_interviews()
+        last_sync = self.db.get_last_drive_sync()
+        if last_sync:
+            try:
+                last_sync_time = datetime.fromisoformat(last_sync).astimezone()
+                self.drive_refresh_status.setText(
+                    f"Updated from Drive at {last_sync_time.strftime('%H:%M')}"
+                )
+                return
+            except ValueError:
+                pass
+        self.drive_refresh_status.setText("Google Sheets are up to date")
+
+    def _on_drive_refresh_failed(self, error: str):
+        self.drive_refresh_status.setText("Refresh failed; showing saved data")
+        self._show_error(f"Could not refresh data from Google Sheets: {error}")
+
+    def _on_drive_refresh_finished(self):
+        self.drive_refresh_button.setEnabled(True)
+        self.drive_refresh_button.setText("↻  Refresh from Drive")
+        worker = getattr(self, "drive_refresh_worker", None)
+        self.drive_refresh_worker = None
+        if worker is not None:
+            worker.deleteLater()
+
+    def _drive_refresh_is_running(self) -> bool:
+        worker = getattr(self, "drive_refresh_worker", None)
+        if worker is not None and worker.isRunning():
+            self._show_error("Please wait for the Google Sheets refresh to finish.")
+            return True
+        return False
 
     def _build_meetings_page(self):
         page = QWidget()
@@ -2605,6 +2695,8 @@ class WeRhereMainWindow(QMainWindow):
         dialog = ApplicationSourceDialog(headers, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        if self._drive_refresh_is_running():
+            return
         try:
             self.db.save_application_source_record_to_drive(dialog.data())
         except (DriveImportError, ValueError, OSError) as error:
@@ -2626,6 +2718,8 @@ class WeRhereMainWindow(QMainWindow):
             record["headers"], record["fields"], self
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self._drive_refresh_is_running():
             return
         try:
             self.db.save_application_source_record_to_drive(
@@ -2844,6 +2938,8 @@ class WeRhereMainWindow(QMainWindow):
             meeting, recommendation_options, vit_group=vit_group, parent=self
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self._drive_refresh_is_running():
             return
         try:
             self.db.save_mentor_interview_to_drive(meeting["id"], dialog.data())

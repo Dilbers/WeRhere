@@ -192,6 +192,26 @@ class DatabaseManager:
             self.import_workbooks(workbook_sources)
         else:
             self._refresh_source_records(workbook_sources)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_meta (key, value)
+                VALUES ('last_drive_sync', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (datetime.now().astimezone().isoformat(timespec="minutes"),),
+            )
+
+    def refresh_drive_data(self) -> None:
+        """Download the latest Google Sheets data and refresh the local cache."""
+        self._sync_drive_data()
+
+    def get_last_drive_sync(self) -> Optional[str]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_meta WHERE key = 'last_drive_sync'"
+            ).fetchone()
+        return row["value"] if row else None
 
     def _refresh_source_records(self, workbook_sources: Mapping[str, bytes]) -> None:
         parsed = read_workbooks(workbook_sources)
